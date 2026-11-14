@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Календарь игр Вестмарша</title>
+<meta name="description" content="Неофициальная закладка для сайта Вестмарша: календарь игр по дням и подсветка игр, на которые вы записаны.">
+<style>
+:root {
+  --bg: #f3f2f6; --card: #ffffff; --ink: #1b1b2f; --soft: #5f5b70; --line: rgba(27,27,47,.12);
+  --accent: #2f6b4f; --accent-soft: rgba(47,107,79,.1); --warm: #8a5a3c; --code: #ecebf1;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12121a; --card: #1e1e2a; --ink: #e8e6ef; --soft: #a8a4b8; --line: rgba(232,230,239,.12);
+    --accent: #6fbf8f; --accent-soft: rgba(111,191,143,.14); --warm: #d4b896; --code: #2a2a38;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 46rem; margin: 0 auto; padding: 2.5rem 16px 3rem; }
+h1, h2 { font-family: Georgia, "Times New Roman", serif; line-height: 1.2; }
+h1 { font-size: clamp(1.7rem, 5vw, 2.3rem); margin: 0 0 .5rem; }
+h2 { font-size: 1.25rem; margin: 0 0 .75rem; }
+p { margin: 0 0 .75rem; }
+.lead { color: var(--soft); font-size: 1.05rem; margin-bottom: 1.5rem; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 1.25rem 1.25rem 1rem; margin-bottom: 1rem; }
+ol { margin: 0 0 .75rem; padding-left: 1.3rem; }
+li { margin: .35rem 0; }
+kbd, code { font: .88em ui-monospace, Consolas, monospace; background: var(--code); border-radius: 5px; padding: .08rem .35rem; }
+a { color: var(--accent); }
+.bm-row { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; margin: .5rem 0 1rem; }
+.bm { display: inline-flex; align-items: center; gap: .4rem; padding: .7rem 1.2rem; border-radius: 999px; background: var(--accent);
+  color: #fff; font-weight: 700; text-decoration: none; cursor: grab; box-shadow: 0 4px 14px rgba(47,107,79,.3); }
+@media (prefers-color-scheme: dark) { .bm { color: #10170f; } }
+.bm:active { cursor: grabbing; }
+.hint { color: var(--soft); font-size: .9rem; }
+.hint.warn { color: var(--warm); font-weight: 600; }
+.copy { display: grid; gap: .5rem; margin: .5rem 0 1rem; }
+textarea { width: 100%; min-height: 5.5rem; resize: vertical; padding: .6rem .7rem; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--code); color: var(--ink); font: .8rem/1.4 ui-monospace, Consolas, monospace; word-break: break-all; }
+button { justify-self: start; padding: .55rem 1.1rem; border-radius: 999px; border: 1px solid var(--accent); background: var(--accent-soft);
+  color: var(--ink); font: inherit; font-weight: 600; cursor: pointer; }
+h3 { font-size: 1rem; margin: 1rem 0 .4rem; }
+.foot { color: var(--soft); font-size: .88rem; margin-top: 1.5rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Календарь игр Вестмарша</h1>
+  <p class="lead">Закладка для сайта <a href="https://vestmarch.noncensored.ru/games">vestmarch.noncensored.ru</a>: над списком игр появляется
+    календарь по дням, а игры, на которые вы записаны, подсвечены и показаны первыми. Это неофициальное дополнение, к администрации сайта оно не относится.</p>
+
+  <section class="card">
+    <h2>На компьютере</h2>
+    <ol>
+      <li>Включите панель закладок: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> (на Mac <kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>).</li>
+      <li>Перетащите кнопку мышкой на панель закладок:</li>
+    </ol>
+    <div class="bm-row">
+      <a class="bm" id="bm" href="#">📅 Календарь Вестмарша</a>
+      <span class="hint" id="bm-hint">не нажимайте, а перетащите</span>
+    </div>
+    <ol start="3">
+      <li>Откройте <a href="https://vestmarch.noncensored.ru/games">страницу «Игры»</a> и нажмите эту закладку.</li>
+    </ol>
+    <p class="hint">Нажимать закладку нужно один раз после открытия сайта. Пока вкладка открыта, календарь сам появляется при каждом заходе в «Игры».
+      Чтобы видеть свои записи, войдите на сайт под своим аккаунтом.</p>
+  </section>
+
+  <section class="card">
+    <h2>На телефоне</h2>
+    <p>Перетаскивать там нечего, поэтому закладку создают вручную. Сначала скопируйте этот код:</p>
+    <div class="copy">
+      <textarea id="code" readonly aria-label="Код закладки"></textarea>
+      <button type="button" id="copy">Скопировать код</button>
+    </div>
+    <h3>Android (Chrome, Яндекс Браузер)</h3>
+    <ol>
+      <li>Откройте любую страницу и добавьте её в закладки (звёздочка в меню).</li>
+      <li>Откройте закладки, измените новую закладку: название — <b>Календарь</b>, адрес — вставьте скопированный код.</li>
+      <li>На странице «Игры» Вестмарша начните вводить в адресной строке «Календарь» и выберите закладку из подсказок.</li>
+    </ol>
+    <h3>iPhone и iPad (Safari)</h3>
+    <ol>
+      <li>Откройте любую страницу: «Поделиться» → «Добавить закладку», назовите её <b>Календарь</b>.</li>
+      <li>Откройте закладки → «Изменить» → выберите её и замените адрес скопированным кодом.</li>
+      <li>На странице «Игры» Вестмарша откройте закладки и нажмите «Календарь».</li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>Как это работает</h2>
+    <p>Закладка подгружает небольшой скрипт с этой страницы. Скрипт берёт список игр и ваши записи с самого сайта Вестмарша, то же, что видит сайт,
+      и рисует календарь. Он ничего не меняет на сайте и ничего никуда не отправляет. Исходный код открыт:
+      <a href="https://github.com/malan-x/vestmarch-calendar">github.com/malan-x/vestmarch-calendar</a>.</p>
+    <p>Обновления приходят сами: переустанавливать закладку не нужно.</p>
+    <p class="hint">Если пользуетесь Tampermonkey или Violentmonkey, можно поставить
+      <a href="vestmarch-calendar.user.js">userscript-версию</a>: тогда календарь появляется без нажатия закладки.</p>
+  </section>
+
+  <p class="foot">Если сайт поменяется и календарь перестанет появляться, напишите автору закладки.</p>
+</main>
+<script>
+  const SCRIPT_URL = new URL('vestmarch-calendar.user.js', location.href).href;
+  const LOADER = "javascript:(()=>{if(location.hostname!=='vestmarch.noncensored.ru'){alert('Откройте сайт Вестмарша и нажмите закладку там');return}"
+    + "if(window.__vmcalLoaded||document.getElementById('vmcal-js'))return;"
+    + "const s=document.createElement('script');s.id='vmcal-js';s.src='" + SCRIPT_URL + "';"
+    + "s.onerror=()=>alert('Не удалось загрузить календарь');document.head.append(s)})()";
+
+  const bm = document.getElementById('bm');
+  const hint = document.getElementById('bm-hint');
+  bm.href = LOADER;
+  bm.addEventListener('click', (e) => {
+    e.preventDefault();
+    hint.textContent = 'Эту кнопку нужно перетащить на панель закладок, а нажимать уже на сайте Вестмарша';
+    hint.classList.add('warn');
+  });
+
+  const code = document.getElementById('code');
+  const copyBtn = document.getElementById('copy');
+  code.value = LOADER;
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(LOADER);
+    } catch {
+      code.focus();
+      code.select();
+      document.execCommand('copy');
+    }
+    copyBtn.textContent = 'Скопировано ✓';
+    setTimeout(() => { copyBtn.textContent = 'Скопировать код'; }, 2000);
+  });
+</script>
+</body>
+</html>
