@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.2.0
-// @description  Лента-календарь над списком игр. Игры, на которые вы записаны, подсвечены и вынесены наверх.
+// @version      1.3.0
+// @description  Лента-календарь над списком игр. Ваши записи подсвечены и вынесены наверх; можно добавить свои ваншоты, модули и кампании и видеть накладки.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
 // @downloadURL  https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -23,6 +23,9 @@
   const MAX_DAYS = 45;         // и не больше столько
   const SHOW_IMAGES = true;    // обложки игр в карточках (уменьшенные, ~30 КБ каждая)
   const REFRESH_MS = 60_000;   // при возврате на вкладку обновлять данные не чаще раза в минуту
+  const VM_GAME_HOURS = 4;     // сайт не отдаёт длительность игр — для поиска накладок считаем столько часов
+  const DEFAULT_OWN_HOURS = 4; // длительность своей игры по умолчанию
+  const OWN_KEY = 'vmcal.own.v1'; // свои игры хранятся в localStorage этого сайта, только в этом браузере
 
   const ROOT_ID = 'vmcal';
   const STYLE_ID = 'vmcal-style';
@@ -100,6 +103,320 @@
     return loading;
   }
 
+  // ---------- свои игры: хранятся только в этом браузере ----------
+  // { entries: [{ id, kind, title, master, place, desc, image, hours, sessions: [{ id, date, time, hours, every, until, skip }] }], lastKind }
+  // Ваншот — запись ровно с одной сессией, заводится одним окном. Модуль и кампания сперва заводятся отдельно
+  // (название, описание, картинка), потом к ним добавляются только сессии: выбрал из списка и поставил время.
+  // Картинка — уменьшенный JPEG в data:-URL (~20–40 КБ), чтобы всё жило в localStorage.
+
+  const KINDS = ['oneshot', 'module', 'campaign'];
+  const KIND_LABEL = { oneshot: 'ваншот', module: 'модуль', campaign: 'кампания' };
+  const KIND_TITLE = { oneshot: 'Ваншот', module: 'Модуль', campaign: 'Кампания' };
+  const KIND_ACC = { oneshot: 'ваншот', module: 'модуль', campaign: 'кампанию' }; // «удалить кого/что»
+  const REPEAT_LABEL = ['Не повторять', 'Каждую неделю', 'Раз в 2 недели', 'Раз в 3 недели', 'Раз в 4 недели'];
+  const REPEAT_SHORT = ['', 'каждую неделю', 'раз в 2 недели', 'раз в 3 недели', 'раз в 4 недели'];
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const TIME_RE = /^\d{2}:\d{2}$/;
+  const IMAGE_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
+  const CROP_W = 480; // картинка своей игры хранится ровно в пропорции миниатюры на карточке (3:1)
+  const CROP_H = 160;
+  const CROP_MAX_ZOOM = 5;
+  const DESC_MAX = 1000;
+
+  const newId = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+  const clampHours = (x) => {
+    const n = Number(x);
+    return Number.isFinite(n) && n > 0 ? Math.min(24, Math.max(0.5, Math.round(n * 2) / 2)) : DEFAULT_OWN_HOURS;
+  };
+  const cleanText = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+
+  function normSession(x, fallbackHours) {
+    const time = typeof x?.time === 'string' ? x.time.slice(0, 5) : '';
+    if (!x || !DATE_RE.test(x.date) || !TIME_RE.test(time)) return null;
+    const every = [0, 1, 2, 3, 4].includes(x.every) ? x.every : 0;
+    return {
+      id: typeof x.id === 'string' ? x.id : newId(),
+      date: x.date,
+      time,
+      hours: clampHours(x.hours ?? fallbackHours),
+      every,
+      until: every && DATE_RE.test(x.until || '') ? x.until : '',
+      skip: every && Array.isArray(x.skip) ? x.skip.filter((d) => DATE_RE.test(d)) : [],
+    };
+  }
+
+  function normEntry(x) {
+    if (!x || !KINDS.includes(x.kind)) return null;
+    const title = cleanText(x.title, 80);
+    if (!title) return null;
+    const hours = clampHours(x.hours);
+    const sessions = (Array.isArray(x.sessions) ? x.sessions : []).map((s) => normSession(s, hours)).filter(Boolean);
+    if (x.kind === 'oneshot' && sessions.length === 0) return null;
+    return {
+      id: typeof x.id === 'string' ? x.id : newId(),
+      kind: x.kind,
+      title,
+      master: cleanText(x.master, 60),
+      place: cleanText(x.place, 80),
+      desc: cleanText(x.desc, DESC_MAX),
+      image: typeof x.image === 'string' && x.image.length < 400_000 && IMAGE_RE.test(x.image) ? x.image : '',
+      hours,
+      sessions: x.kind === 'oneshot' ? sessions.slice(0, 1) : sessions,
+    };
+  }
+
+  function loadOwn() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(OWN_KEY) || 'null');
+      const entries = (Array.isArray(raw?.entries) ? raw.entries : []).map(normEntry).filter(Boolean);
+      return { entries, lastKind: KINDS.includes(raw?.lastKind) ? raw.lastKind : 'oneshot' };
+    } catch {
+      return { entries: [], lastKind: 'oneshot' };
+    }
+  }
+
+  // Меняет сохранённые игры и перерисовывает ленту. false — сохранить не удалось (окно тогда не закрываем).
+  function updateOwn(change) {
+    const store = loadOwn();
+    change(store);
+    try {
+      localStorage.setItem(OWN_KEY, JSON.stringify({ v: 1, entries: store.entries.map(normEntry).filter(Boolean), lastKind: store.lastKind }));
+    } catch (e) {
+      alert(e?.name === 'QuotaExceededError'
+        ? 'Не удалось сохранить: в браузере кончилось место для этого сайта. Уберите картинки у старых игр или удалите лишние.'
+        : 'Не удалось сохранить: браузер не даёт этому сайту хранить данные (например, в приватном режиме).');
+      return false;
+    }
+    render();
+    return true;
+  }
+
+  function loadImage(blob) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => resolve({ img, url });
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('не удалось открыть картинку'));
+      };
+      img.src = url;
+    });
+  }
+
+  // Окно кадрирования поверх текущего окна. Рамка 3:1 — то, что попадёт на карточку; вокруг затемнён остаток картинки.
+  // Перетаскивание сдвигает картинку, ползунок / −+ / колесо / два пальца меняют масштаб.
+  // Результат — JPEG CROP_W×CROP_H в data:-URL (~15–30 КБ) или null, если окно закрыли.
+  async function cropImage(blob) {
+    const { img, url } = await loadImage(blob);
+    const W = img.naturalWidth;
+    const H = img.naturalHeight;
+    img.className = 'vmcal-crop-img';
+    img.alt = '';
+    img.draggable = false;
+    img.style.width = `${W}px`;
+    img.style.height = `${H}px`;
+
+    return new Promise((resolve) => {
+      const win = h('div', { class: 'vmcal-crop-win' });
+      const stage = h('div', { class: 'vmcal-crop' }, img, win);
+      const zoom = h('input', { type: 'range', min: 1, max: CROP_MAX_ZOOM, step: 0.01, value: 1, 'aria-label': 'Масштаб' });
+      const dlg = h('dialog', { class: 'vmcal-dialog vmcal-crop-dialog', 'aria-label': 'Участок картинки', tabindex: -1 },
+        h('div', { class: 'vmcal-form' },
+          h('h3', null, 'Участок картинки'),
+          stage,
+          h('div', { class: 'vmcal-zoom' },
+            h('button', { type: 'button', class: 'vmcal-btn small', 'aria-label': 'Уменьшить', onclick: () => zoomTo(z / 1.25) }, '−'),
+            zoom,
+            h('button', { type: 'button', class: 'vmcal-btn small', 'aria-label': 'Увеличить', onclick: () => zoomTo(z * 1.25) }, '+'),
+          ),
+          h('p', { class: 'vmcal-hint' }, 'Перетащите картинку, чтобы в рамку попал нужный участок. Масштаб — ползунком, колесом мыши или двумя пальцами.'),
+          h('div', { class: 'vmcal-actions' },
+            h('div', { class: 'vmcal-actions-main' },
+              h('button', { type: 'button', class: 'vmcal-btn', onclick: () => finish(null) }, 'Отмена'),
+              h('button', { type: 'button', class: 'vmcal-btn primary', onclick: () => finish(output()) }, 'Готово'),
+            ),
+          ),
+        ),
+      );
+
+      // x, y — где левый верхний угол картинки относительно рамки; s0 — масштаб, при котором картинка ровно закрывает рамку.
+      let fw = 0, fh = 0, ox = 0, oy = 0, s0 = 1, z = 1, x = 0, y = 0, stageW = 0;
+      const scale = () => s0 * z;
+      const apply = () => {
+        x = Math.min(0, Math.max(fw - W * scale(), x)); // рамка всегда целиком закрыта картинкой
+        y = Math.min(0, Math.max(fh - H * scale(), y));
+        img.style.transform = `translate(${x + ox}px, ${y + oy}px) scale(${scale()})`;
+        zoom.value = z;
+      };
+      // масштаб вокруг точки (px, py) рамки: эта точка картинки остаётся на месте
+      function zoomTo(nz, px = fw / 2, py = fh / 2) {
+        const ix = (px - x) / scale();
+        const iy = (py - y) / scale();
+        z = Math.min(CROP_MAX_ZOOM, Math.max(1, nz));
+        x = px - ix * scale();
+        y = py - iy * scale();
+        apply();
+      }
+      function layout() {
+        const sw = stage.clientWidth;
+        if (!sw || sw === stageW) return;
+        stageW = sw;
+        // центр видимого участка сохраняем при смене размера окна
+        const cx = fw ? (fw / 2 - x) / scale() : W / 2;
+        const cy = fh ? (fh / 2 - y) / scale() : H / 2;
+        ox = Math.round(sw * 0.07);
+        fw = sw - 2 * ox;
+        fh = fw * CROP_H / CROP_W;
+        oy = Math.round(fh * 0.4);
+        stage.style.height = `${Math.round(fh + 2 * oy)}px`;
+        Object.assign(win.style, { left: `${ox}px`, top: `${oy}px`, width: `${fw}px`, height: `${fh}px` });
+        s0 = Math.max(fw / W, fh / H);
+        x = fw / 2 - cx * scale();
+        y = fh / 2 - cy * scale();
+        apply();
+      }
+      function output() {
+        const canvas = document.createElement('canvas');
+        canvas.width = CROP_W;
+        canvas.height = CROP_H;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff'; // прозрачный PNG в JPEG иначе станет чёрным
+        ctx.fillRect(0, 0, CROP_W, CROP_H);
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, -x / scale(), -y / scale(), fw / scale(), fh / scale(), 0, 0, CROP_W, CROP_H);
+        return canvas.toDataURL('image/jpeg', 0.85);
+      }
+
+      // перетаскивание одним указателем, щипок двумя (мышь, палец, перо — всё через pointer events)
+      const pts = new Map();
+      let last = null;
+      const local = (e) => {
+        const r = stage.getBoundingClientRect();
+        return { x: e.clientX - r.left - ox, y: e.clientY - r.top - oy };
+      };
+      const snapshot = () => {
+        const p = [...pts.values()];
+        if (p.length === 1) return { x: p[0].x, y: p[0].y };
+        return { d: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y), mx: (p[0].x + p[1].x) / 2, my: (p[0].y + p[1].y) / 2 };
+      };
+      stage.addEventListener('pointerdown', (e) => {
+        stage.setPointerCapture(e.pointerId);
+        pts.set(e.pointerId, local(e));
+        last = snapshot();
+        stage.classList.add('is-dragging');
+      });
+      stage.addEventListener('pointermove', (e) => {
+        if (!pts.has(e.pointerId)) return;
+        pts.set(e.pointerId, local(e));
+        const now = snapshot();
+        if (pts.size === 1 && last && 'x' in last) {
+          x += now.x - last.x;
+          y += now.y - last.y;
+          apply();
+        } else if (pts.size >= 2 && last && 'd' in last && last.d > 0) {
+          x += now.mx - last.mx;
+          y += now.my - last.my;
+          zoomTo(z * (now.d / last.d), now.mx, now.my);
+        }
+        last = now;
+      });
+      const release = (e) => {
+        pts.delete(e.pointerId);
+        last = pts.size ? snapshot() : null;
+        if (!pts.size) stage.classList.remove('is-dragging');
+      };
+      stage.addEventListener('pointerup', release);
+      stage.addEventListener('pointercancel', release);
+      stage.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const p = local(e);
+        zoomTo(z * Math.exp(-e.deltaY * 0.0015), p.x, p.y);
+      }, { passive: false });
+      zoom.addEventListener('input', () => zoomTo(Number(zoom.value)));
+
+      const ro = new ResizeObserver(layout);
+      let done = false;
+      function finish(result) {
+        if (done) return;
+        done = true;
+        ro.disconnect();
+        URL.revokeObjectURL(url);
+        dlg.close();
+        resolve(result);
+      }
+      dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); }); // Esc
+      dlg.addEventListener('close', () => { dlg.remove(); finish(null); });
+
+      document.body.append(dlg);
+      dlg.showModal(); // поверх окна игры: модальные окна складываются стопкой
+      dlg.focus();
+      layout();
+      ro.observe(stage);
+    });
+  }
+
+  // Картинка из буфера обмена по кнопке. null — картинки в буфере нет; исключение — браузер не дал прочитать буфер.
+  async function readClipboardImage() {
+    if (!navigator.clipboard?.read) throw new Error('clipboard.read не поддерживается');
+    for (const item of await navigator.clipboard.read()) {
+      const type = item.types.find((t) => t.startsWith('image/'));
+      if (type) return item.getType(type);
+    }
+    return null;
+  }
+
+  // Все сессии своих игр, попадающие в дни [from, to).
+  function ownOccurrences(entries, from, to) {
+    const out = [];
+    for (const entry of entries) {
+      for (const session of entry.sessions) {
+        const first = parseDate(session.date);
+        const step = session.every * 7;
+        const until = session.until ? parseDate(session.until) : null;
+        const skip = new Set(session.skip);
+        for (let n = step && first < from ? Math.ceil(dayDiff(first, from) / step) : 0; ; n++) {
+          const day = addDays(first, n * step);
+          if (day >= to || (until && day > until)) break;
+          if (day >= from && !skip.has(isoDate(day))) {
+            const start = withTime(day, session.time);
+            out.push({ entry, session, day: isoDate(day), start, end: new Date(+start + session.hours * 3_600_000) });
+          }
+          if (!step) break;
+        }
+      }
+    }
+    return out;
+  }
+
+  // Накладки: свои сессии против игр Вестмарша и друг против друга.
+  // vm: id игры → свои сессии в это время; own: сессия → с чем она конфликтует (ваши записи и другие свои игры).
+  function findClashes(upcoming, occ) {
+    const vm = new Map();
+    const own = new Map();
+    const add = (map, key, item) => {
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(item);
+    };
+    const hit = (a, b) => a.start < b.end && b.start < a.end;
+    const spans = upcoming.filter((g) => g.status !== 'done').map((g) => {
+      const start = new Date(g.startsAt);
+      return { g, start, end: new Date(+start + VM_GAME_HOURS * 3_600_000) };
+    });
+    for (const o of occ) {
+      const mine = { title: o.entry.title, label: KIND_LABEL[o.entry.kind], start: o.start, end: o.end };
+      for (const s of spans) {
+        if (!hit(o, s)) continue;
+        add(vm, s.g.id, mine);
+        if (cache.mine.has(s.g.id)) add(own, o, { title: s.g.title, label: 'Вестмарш, вы записаны', start: s.start, end: s.end });
+      }
+      for (const p of occ) {
+        if (p !== o && hit(o, p)) add(own, o, { title: p.entry.title, label: KIND_LABEL[p.entry.kind], start: p.start, end: p.end });
+      }
+    }
+    return { vm, own };
+  }
+
   // ---------- утилиты ----------
 
   function h(tag, attrs, ...kids) {
@@ -121,6 +438,18 @@
   const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
   const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
   const byStart = (a, b) => a.startsAt.localeCompare(b.startsAt);
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const isoDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const parseDate = (s) => {
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d);
+  };
+  const withTime = (day, hhmm) => {
+    const [hh, mm] = hhmm.split(':').map(Number);
+    return new Date(day.getFullYear(), day.getMonth(), day.getDate(), hh, mm);
+  };
+  const dayDiff = (a, b) => Math.round((startOfDay(b) - startOfDay(a)) / 86_400_000);
+  const timeRange = (a, b) => `${fmtTime.format(a)}–${fmtTime.format(b)}`;
 
   function levelText(g) {
     return g.levelMax == null || g.levelMax === g.levelMin ? `${g.levelMin}` : `${g.levelMin}–${g.levelMax}`;
@@ -164,13 +493,19 @@
 
   // ---------- отрисовка ----------
 
-  function buildCard(g, signup) {
+  function clashNode(list) {
+    const names = [...new Set(list.map((c) => c.title))].join(', ');
+    const details = list.map((c) => `${c.title} (${c.label}), ${timeRange(c.start, c.end)}`).join('\n');
+    return h('div', { class: 'vmcal-card-clash', title: details }, `⚠ Накладка: ${names}`);
+  }
+
+  function buildCard(g, signup, clash) {
     const start = new Date(g.startsAt);
     const href = `/games/${g.id}`;
     const img = SHOW_IMAGES ? imageUrl(g) : null;
     const meta = [g.masterName, `ур. ${levelText(g)}`, priceText(g.priceRub)].filter(Boolean).join(' · ');
     return h('a', {
-      class: `vmcal-card status-${g.status}${signup ? ' is-mine' : ''}`,
+      class: `vmcal-card status-${g.status}${signup ? ' is-mine' : ''}${clash ? ' is-clash' : ''}`,
       href,
       title: g.title,
       onclick: spaNavigate,
@@ -187,8 +522,432 @@
         h('div', { class: 'vmcal-card-title' }, g.title, g.isTest ? h('span', { class: 'muted tiny' }, ' · тест') : null),
         h('div', { class: 'vmcal-card-meta' }, meta),
         signup && h('div', { class: 'vmcal-card-mine', title: mineTitle(signup) }, `✓ ${mineLabel(signup)}`),
+        clash && clashNode(clash),
       ),
     );
+  }
+
+  function buildOwnCard(o, clash) {
+    const { entry, session } = o;
+    const parts = [entry.master, entry.place, REPEAT_SHORT[session.every]].filter(Boolean);
+    if (!parts.length && entry.desc) parts.push(entry.desc.split('\n')[0]);
+    const meta = parts.join(' · ');
+    const tip = [
+      entry.title,
+      entry.master && `Мастер: ${entry.master}`,
+      entry.place && `Место: ${entry.place}`,
+      entry.desc && `\n${entry.desc}`,
+      '\nНажмите, чтобы изменить',
+    ];
+    return h('button', {
+      type: 'button',
+      class: `vmcal-card is-own${clash ? ' is-clash' : ''}`,
+      title: tip.filter(Boolean).join('\n'),
+      onclick: () => openSession(o),
+    },
+      SHOW_IMAGES && entry.image ? h('img', { class: 'vmcal-thumb', src: entry.image, alt: '' }) : null,
+      h('div', { class: 'vmcal-card-body' },
+        h('div', { class: 'vmcal-card-top' },
+          h('span', { class: 'vmcal-time' }, timeRange(o.start, o.end)),
+          h('span', { class: 'vmcal-status vmcal-kind' }, KIND_LABEL[entry.kind]),
+        ),
+        h('div', { class: 'vmcal-card-title' }, entry.title),
+        meta ? h('div', { class: 'vmcal-card-meta' }, meta) : null,
+        clash && clashNode(clash),
+      ),
+    );
+  }
+
+  // ---------- окна добавления и правки своих игр ----------
+
+  const field = (label, ...inputs) => h('label', { class: 'vmcal-field' }, h('span', null, label), ...inputs);
+  const textInput = (value, max, required, placeholder) => h('input', {
+    type: 'text', value, maxlength: max, required, placeholder, autocomplete: 'off', pattern: required ? '.*\\S.*' : null,
+  });
+  const descInput = (value) => h('textarea', { maxlength: DESC_MAX, rows: 3, placeholder: 'Система, что взять с собой — по желанию' }, value);
+
+  // Уникальные непустые имена без учёта регистра, в исходном порядке.
+  function uniqueNames(list) {
+    const seen = new Set();
+    const out = [];
+    for (const v of list) {
+      const name = typeof v === 'string' ? v.trim() : '';
+      if (name && !seen.has(name.toLowerCase())) {
+        seen.add(name.toLowerCase());
+        out.push(name);
+      }
+    }
+    return out;
+  }
+
+  // Подсказки: сначала то, что вы уже вводили (последнее — выше), потом мастера из игр Вестмарша.
+  const knownMasters = () => uniqueNames([
+    ...loadOwn().entries.map((e) => e.master).reverse(),
+    ...(cache?.games || []).map((g) => g.masterName).sort((a, b) => String(a).localeCompare(String(b), 'ru')),
+  ]);
+  const knownPlaces = () => uniqueNames(loadOwn().entries.map((e) => e.place).reverse());
+
+  // Мастер и место проведения: обычные поля с подсказками браузера (<datalist>) — вариант можно выбрать или вписать свой.
+  let listSeq = 0;
+  function masterPlaceFields(e) {
+    const suggest = (value, max, placeholder, options) => {
+      const id = `vmcal-list-${++listSeq}`;
+      return [
+        h('input', { type: 'text', value: value || '', maxlength: max, placeholder, autocomplete: 'off', list: id }),
+        h('datalist', { id }, options.map((v) => h('option', { value: v }))),
+      ];
+    };
+    const [master, masterList] = suggest(e.master, 60, 'Имя мастера', knownMasters());
+    const [place, placeList] = suggest(e.place, 80, 'Discord, клуб…', knownPlaces());
+    return {
+      node: h('div', { class: 'vmcal-row two' }, field('Мастер', master, masterList), field('Место проведения', place, placeList)),
+      read: () => ({ master: master.value, place: place.value }),
+    };
+  }
+  const linkBtn = (label, onclick) => h('button', { type: 'button', class: 'vmcal-link', onclick }, label);
+  // Кнопка действия в окне: если action вернул false (например, отказ в confirm), окно не закрываем.
+  const dangerBtn = (label, action) => h('button', {
+    type: 'button',
+    class: 'vmcal-btn danger',
+    onclick: (e) => {
+      const dlg = e.currentTarget.closest('dialog');
+      if (action() !== false) dlg.close();
+    },
+  }, label);
+
+  // Поле картинки: файл (с телефона — из галереи), буфер обмена (кнопкой или Ctrl+V в окне), затем кадрирование.
+  function imageField(initial) {
+    let value = initial || '';
+    const preview = h('img', { class: 'vmcal-img-preview', alt: '' });
+    const file = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    const status = h('p', { class: 'vmcal-hint vmcal-img-status' });
+    const say = (text) => {
+      status.textContent = text;
+      status.hidden = !text;
+    };
+    const sync = () => {
+      preview.hidden = !value;
+      if (value) preview.src = value;
+      else preview.removeAttribute('src');
+      clearBtn.hidden = !value;
+    };
+    const take = async (blob) => {
+      say('');
+      try {
+        const result = await cropImage(blob);
+        if (result) value = result;
+      } catch {
+        say('Не получилось открыть эту картинку.');
+      }
+      sync();
+    };
+    const fileBtn = h('button', { type: 'button', class: 'vmcal-btn small', onclick: () => file.click() }, 'Файл…');
+    const pasteBtn = h('button', {
+      type: 'button',
+      class: 'vmcal-btn small',
+      title: 'Вставить скопированную картинку (или Ctrl+V в этом окне)',
+      onclick: async () => {
+        say('');
+        let blob;
+        try {
+          blob = await readClipboardImage();
+        } catch {
+          say('Браузер не дал прочитать буфер обмена. Нажмите Ctrl+V прямо в этом окне.');
+          return;
+        }
+        if (blob) take(blob);
+        else say('В буфере нет картинки. Скопируйте саму картинку: правой кнопкой по ней → «Копировать картинку».');
+      },
+    }, 'Из буфера');
+    const clearBtn = linkBtn('убрать', () => {
+      value = '';
+      say('');
+      sync();
+    });
+    file.addEventListener('change', () => {
+      const f = file.files?.[0];
+      file.value = '';
+      if (f) take(f);
+    });
+    const node = h('div', { class: 'vmcal-field' },
+      h('span', null, 'Картинка'),
+      h('div', { class: 'vmcal-img' }, preview, h('div', { class: 'vmcal-img-actions' }, fileBtn, pasteBtn, clearBtn), file),
+      status,
+    );
+    // Ctrl+V в окне: забираем только картинки, текст вставляется в поля как обычно.
+    const onPaste = (e) => {
+      if (!node.isConnected) {
+        document.removeEventListener('paste', onPaste); // окно закрыто
+        return;
+      }
+      if (!node.getClientRects().length || document.querySelector('dialog.vmcal-crop-dialog')) return; // поле скрыто или уже кадрируем
+      const f = [...(e.clipboardData?.files || [])].find((x) => x.type.startsWith('image/'));
+      if (!f) return;
+      if (e.target.matches?.('input, textarea') && e.clipboardData.getData('text/plain')) return; // в поле вставляют текст
+      e.preventDefault();
+      take(f);
+    };
+    document.addEventListener('paste', onPaste);
+    say('');
+    sync();
+    return { node, value: () => value };
+  }
+
+  function showDialog(heading, fields, submitLabel, onSubmit, extra = []) {
+    for (const old of document.querySelectorAll('dialog.vmcal-dialog')) old.close();
+    const dlg = h('dialog', { class: 'vmcal-dialog', 'aria-label': heading, tabindex: -1 });
+    const form = h('form', { class: 'vmcal-form' },
+      h('h3', null, heading),
+      ...fields,
+      h('div', { class: 'vmcal-actions' },
+        extra.length ? h('div', { class: 'vmcal-actions-extra' }, extra) : null,
+        h('div', { class: 'vmcal-actions-main' },
+          h('button', { type: 'button', class: 'vmcal-btn', onclick: () => dlg.close() }, 'Отмена'),
+          h('button', { type: 'submit', class: 'vmcal-btn primary' }, submitLabel),
+        ),
+      ),
+    );
+    // onSubmit вернул false — сохранить не вышло, окно оставляем с введёнными данными
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (onSubmit() !== false) dlg.close();
+    });
+    // Закрытие кликом по затемнению (но не когда выделение текста в поле закончилось за пределами окна).
+    let downOnBackdrop = false;
+    dlg.addEventListener('pointerdown', (e) => { downOnBackdrop = e.target === dlg; });
+    dlg.addEventListener('click', (e) => { if (downOnBackdrop && e.target === dlg) dlg.close(); });
+    dlg.addEventListener('close', () => dlg.remove());
+    dlg.append(form);
+    // В <body>, а не в ленту: лента перерисовывается целиком и унесла бы открытое окно.
+    document.body.append(dlg);
+    dlg.showModal();
+    // фокус на само окно: иначе браузер ставит его на первую кнопку и рисует вокруг неё рамку
+    dlg.focus();
+    return dlg;
+  }
+
+  // Поля одной сессии: дата, время, длительность и (для модулей и кампаний) повтор.
+  function sessionFields(s) {
+    const date = h('input', { type: 'date', required: true, value: s.date });
+    const time = h('input', { type: 'time', required: true, value: s.time });
+    const hours = h('input', { type: 'number', required: true, min: 0.5, max: 24, step: 0.5, value: s.hours, inputmode: 'decimal' });
+    const every = h('select', null, REPEAT_LABEL.map((t, i) => h('option', { value: i, selected: s.every === i }, t)));
+    const until = h('input', { type: 'date', value: s.until || '' });
+    const dateField = field('Дата', date);
+    const untilField = field('До (необязательно)', until);
+    const repeatRow = h('div', { class: 'vmcal-row two' }, field('Повтор', every), untilField);
+    let repeatable = true;
+    const sync = () => {
+      const repeating = repeatable && every.value !== '0';
+      untilField.hidden = !repeating;
+      until.disabled = !repeating; // скрытое поле не должно мешать проверке формы
+      until.min = date.value;
+      dateField.firstChild.textContent = repeating ? 'Первая дата' : 'Дата';
+    };
+    every.addEventListener('change', sync);
+    date.addEventListener('change', sync);
+    sync();
+    return {
+      nodes: [h('div', { class: 'vmcal-row' }, dateField, field('Начало', time), field('Часов', hours)), repeatRow],
+      setRepeatable(v) {
+        repeatable = v;
+        repeatRow.hidden = !v;
+        sync();
+      },
+      setHours(v) { hours.value = v; },
+      read() {
+        const ev = repeatable ? Number(every.value) : 0;
+        return { date: date.value, time: time.value.slice(0, 5), hours: clampHours(hours.value), every: ev, until: ev ? until.value : '' };
+      },
+    };
+  }
+
+  // «Своя игра». Ваншот заводится целиком здесь же; для модуля или кампании — выбрать заведённую и поставить время.
+  function openAdd(opts = {}) {
+    const store = loadOwn();
+    let kind = KINDS.includes(opts.kind) ? opts.kind : store.lastKind;
+    const sf = sessionFields({ date: opts.day || isoDate(new Date()), time: '19:00', hours: DEFAULT_OWN_HOURS, every: 0, until: '' });
+    // после создания или правки модуля/кампании возвращаемся сюда же, с уже выбранной записью и прежней датой
+    const back = (entryId, k) => openAdd({ day: sf.read().date || opts.day, kind: k || kind, entryId });
+    const segBtns = KINDS.map((k) => h('button', { type: 'button', 'data-kind': k, onclick: () => setKind(k) }, KIND_TITLE[k]));
+
+    const title = textInput('', 80, true);
+    const who = masterPlaceFields({});
+    const desc = descInput('');
+    const image = imageField('');
+    const oneshotBox = h('div', { class: 'vmcal-stack' }, field('Название', title), who.node, field('Описание', desc), image.node);
+
+    const pick = h('select', { onchange: () => syncPick() });
+    const pickField = field('', pick);
+    const chosen = () => (kind !== 'oneshot' && pick.value ? store.entries.find((x) => x.id === pick.value) : null);
+    const editLink = linkBtn('изменить', () => {
+      const entry = chosen();
+      if (entry) openEntry(entry, { then: back });
+    });
+    const createEntry = () => openEntry(null, { kind, then: back });
+    const newLink = linkBtn('', createEntry);
+    const seriesBox = h('div', { class: 'vmcal-stack' }, pickField, h('div', { class: 'vmcal-links' }, editLink, newLink));
+    const emptyText = h('p');
+    const emptyBtn = h('button', { type: 'button', class: 'vmcal-btn primary', onclick: createEntry });
+    const emptyBox = h('div', { class: 'vmcal-empty' }, emptyText, emptyBtn);
+    const sessionBox = h('div', { class: 'vmcal-stack' }, sf.nodes);
+
+    const dlg = showDialog('Своя игра', [
+      h('div', { class: 'vmcal-seg', role: 'group', 'aria-label': 'Тип игры' }, segBtns),
+      oneshotBox, seriesBox, emptyBox, sessionBox,
+      h('p', { class: 'vmcal-hint' }, 'Хранится только в этом браузере. Игры Вестмарша в то же время будут отмечены ⚠.'),
+    ], 'Добавить', () => {
+      const session = { id: newId(), ...sf.read(), skip: [] };
+      const entryId = chosen()?.id;
+      if (kind !== 'oneshot' && !entryId) return false;
+      return updateOwn((st) => {
+        st.lastKind = kind;
+        if (kind === 'oneshot') {
+          st.entries.push({
+            id: newId(), kind, title: title.value, ...who.read(), desc: desc.value, image: image.value(), hours: session.hours, sessions: [session],
+          });
+        } else {
+          st.entries.find((x) => x.id === entryId)?.sessions.push(session);
+        }
+      });
+    });
+    const submitBtn = dlg.querySelector('.vmcal-actions-main [type=submit]');
+
+    function setKind(k) {
+      kind = k;
+      for (const b of segBtns) b.setAttribute('aria-pressed', String(b.dataset.kind === k));
+      const series = k !== 'oneshot';
+      const existing = store.entries.filter((x) => x.kind === k);
+      const none = series && existing.length === 0;
+      oneshotBox.hidden = series;
+      title.required = !series;
+      seriesBox.hidden = !series || none;
+      emptyBox.hidden = !none;
+      sessionBox.hidden = none;
+      submitBtn.hidden = none;
+      pick.replaceChildren(...existing.map((x) => h('option', { value: x.id, selected: x.id === opts.entryId }, x.title)));
+      const isModule = k === 'module';
+      pickField.firstChild.textContent = KIND_TITLE[k];
+      newLink.textContent = isModule ? '＋ новый модуль' : '＋ новая кампания';
+      emptyText.textContent = isModule
+        ? 'Модулей пока нет. Сначала заведите модуль: название, мастер, место, описание, картинка. Потом останется выбрать его и поставить время.'
+        : 'Кампаний пока нет. Сначала заведите кампанию: название, мастер, место, описание, картинка. Потом останется выбрать её и поставить время.';
+      emptyBtn.textContent = isModule ? '＋ Завести модуль' : '＋ Завести кампанию';
+      sf.setRepeatable(series);
+      syncPick();
+    }
+    function syncPick() {
+      const entry = chosen();
+      if (entry) sf.setHours(entry.hours);
+    }
+    setKind(kind);
+  }
+
+  // Клик по своей карточке: правка этой сессии (у ваншота — и названия, описания, картинки).
+  function openSession(o) {
+    const { entry, session } = o;
+    const oneshot = entry.kind === 'oneshot';
+    const sf = sessionFields(session);
+    sf.setRepeatable(!oneshot);
+    let title = null;
+    let who = null;
+    let desc = null;
+    let image = null;
+    let head;
+    if (oneshot) {
+      title = textInput(entry.title, 80, true);
+      who = masterPlaceFields(entry);
+      desc = descInput(entry.desc);
+      image = imageField(entry.image);
+      head = [field('Название', title), who.node, field('Описание', desc), image.node];
+    } else {
+      const whoLine = [entry.master && `Мастер: ${entry.master}`, entry.place && `Место: ${entry.place}`].filter(Boolean).join(' · ');
+      head = [h('div', { class: 'vmcal-entry-head' },
+        entry.image ? h('img', { src: entry.image, alt: '' }) : null,
+        h('div', null,
+          h('div', null, h('b', null, `${KIND_TITLE[entry.kind]} «${entry.title}»`), ' · ', linkBtn('изменить', () => openEntry(entry))),
+          whoLine ? h('p', { class: 'vmcal-who' }, whoLine) : null,
+          entry.desc ? h('p', { class: 'vmcal-desc' }, entry.desc) : null,
+        ),
+      )];
+    }
+    const withEntry = (fn) => updateOwn((st) => {
+      const e = st.entries.find((x) => x.id === entry.id);
+      if (e) fn(st, e);
+    });
+    const removeSession = () => withEntry((st, e) => {
+      e.sessions = e.sessions.filter((x) => x.id !== session.id);
+      if (oneshot) st.entries = st.entries.filter((x) => x !== e);
+    });
+
+    const extra = [];
+    if (session.every) {
+      extra.push(dangerBtn(`Убрать ${fmtDate.format(o.start)}`, () => withEntry((st, e) => {
+        e.sessions.find((x) => x.id === session.id)?.skip.push(o.day);
+      })));
+      extra.push(dangerBtn('Удалить все повторы', () => {
+        if (!confirm(`Удалить все сессии «${entry.title}» (${REPEAT_SHORT[session.every]})?`)) return false;
+        return removeSession();
+      }));
+    } else {
+      extra.push(dangerBtn('Удалить', () => {
+        if (!confirm(oneshot ? `Удалить «${entry.title}»?` : `Удалить сессию «${entry.title}» ${fmtDate.format(o.start)}?`)) return false;
+        return removeSession();
+      }));
+    }
+
+    showDialog(oneshot ? 'Ваншот' : 'Сессия', [...head, ...sf.nodes], 'Сохранить', () => {
+      const next = sf.read();
+      return withEntry((st, e) => {
+        const s = e.sessions.find((x) => x.id === session.id);
+        if (!s) return;
+        // пропуски привязаны к датам старой серии: при смене даты или шага повтора они теряют смысл
+        if (next.date !== s.date || next.every !== s.every) s.skip = [];
+        Object.assign(s, next);
+        if (oneshot) Object.assign(e, { title: title.value, ...who.read(), desc: desc.value, image: image.value(), hours: s.hours });
+      });
+    }, extra);
+  }
+
+  // Модуль или кампания как сущность: заводится один раз (название, описание, картинка), сессии добавляются отдельно.
+  // then(id, kind) — куда вернуться после сохранения или удаления (id = null после удаления).
+  function openEntry(entry, { kind = 'campaign', then } = {}) {
+    const isNew = !entry;
+    const base = entry || { kind, title: '', master: '', place: '', desc: '', image: '', hours: DEFAULT_OWN_HOURS, sessions: [] };
+    const id = entry?.id || newId();
+    const kindSel = h('select', null, ['campaign', 'module'].map((k) => h('option', { value: k, selected: base.kind === k }, KIND_TITLE[k])));
+    const hours = h('input', { type: 'number', required: true, min: 0.5, max: 24, step: 0.5, value: base.hours, inputmode: 'decimal' });
+    const title = textInput(base.title, 80, true);
+    const who = masterPlaceFields(base);
+    const desc = descInput(base.desc);
+    const image = imageField(base.image);
+    const count = base.sessions.length;
+    showDialog(isNew ? (base.kind === 'module' ? 'Новый модуль' : 'Новая кампания') : `${KIND_TITLE[base.kind]} «${base.title}»`, [
+      h('div', { class: 'vmcal-row two' }, field('Тип', kindSel), field('Обычно часов', hours)),
+      field('Название', title),
+      who.node,
+      field('Описание', desc),
+      image.node,
+      h('p', { class: 'vmcal-hint' }, isNew
+        ? 'Заводится один раз. Потом в «Своя игра» останется выбрать из списка и поставить время.'
+        : `Сессий в календаре: ${count}. Новую сессию добавляет кнопка «Своя игра».`),
+    ], isNew ? 'Завести' : 'Сохранить', () => {
+      const data = {
+        kind: kindSel.value, title: title.value, ...who.read(), desc: desc.value, image: image.value(), hours: clampHours(hours.value),
+      };
+      const ok = updateOwn((st) => {
+        const e = st.entries.find((x) => x.id === id);
+        if (e) Object.assign(e, data);
+        else st.entries.push({ id, ...data, sessions: [] });
+      });
+      if (ok && then) then(id, data.kind);
+      return ok;
+    }, isNew ? [] : [dangerBtn('Удалить', () => {
+      if (!confirm(`Удалить ${KIND_ACC[base.kind]} «${base.title}» вместе со всеми сессиями (${count})?`)) return false;
+      const ok = updateOwn((st) => { st.entries = st.entries.filter((x) => x.id !== id); });
+      if (ok && then) then(null, base.kind);
+      return ok;
+    })]);
   }
 
   function buildHead(upcoming, strip) {
@@ -210,6 +969,9 @@
     return h('div', { class: 'vmcal-head' },
       h('h2', { class: 'vmcal-title' }, 'Календарь'),
       h('div', { class: 'vmcal-mine' }, mineNode),
+      h('button', {
+        type: 'button', class: 'vmcal-add', title: 'Добавить свой ваншот, модуль или кампанию', onclick: () => openAdd(),
+      }, '＋ Своя игра'),
       h('div', { class: 'vmcal-nav' },
         h('button', { type: 'button', 'aria-label': 'Назад', title: 'Назад', onclick: () => scrollBy(-1) }, '‹'),
         h('button', { type: 'button', 'aria-label': 'Вперёд', title: 'Вперёд', onclick: () => scrollBy(1) }, '›'),
@@ -217,38 +979,48 @@
     );
   }
 
-  function buildStrip(upcoming, today) {
+  function buildStrip(upcoming, occ, clashes, today, total) {
+    // В каждом дне сначала «своё» (ваши записи и свои игры), потом остальное; внутри — по времени.
     const byDay = new Map();
-    for (const g of upcoming) {
-      const k = dayKey(new Date(g.startsAt));
+    const put = (date, item) => {
+      const k = dayKey(date);
       if (!byDay.has(k)) byDay.set(k, []);
-      byDay.get(k).push(g);
+      byDay.get(k).push(item);
+    };
+    for (const g of upcoming) {
+      const start = new Date(g.startsAt);
+      const signup = cache.mine.get(g.id);
+      put(start, { at: +start, first: !!signup, signed: !!signup, make: () => buildCard(g, signup, clashes.vm.get(g.id)) });
     }
-    const last = startOfDay(new Date(upcoming[upcoming.length - 1].startsAt));
-    const span = Math.round((last - today) / 86_400_000) + 1;
-    const total = Math.min(MAX_DAYS, Math.max(MIN_DAYS, span));
+    for (const o of occ) put(o.start, { at: +o.start, first: true, make: () => buildOwnCard(o, clashes.own.get(o)) });
 
     const days = [];
     for (let i = 0; i < total; i++) {
       const d = addDays(today, i);
-      const games = (byDay.get(dayKey(d)) || []).slice().sort((a, b) => {
-        const am = cache.mine.has(a.id) ? 0 : 1;
-        const bm = cache.mine.has(b.id) ? 0 : 1;
-        return am - bm || byStart(a, b);
-      });
+      const items = (byDay.get(dayKey(d)) || []).sort((a, b) => (b.first - a.first) || (a.at - b.at));
       const dow = d.getDay();
       const cls = ['vmcal-day'];
       if (i === 0) cls.push('is-today');
       if (dow === 0 || dow === 6) cls.push('is-weekend');
-      if (games.length === 0) cls.push('is-empty');
-      if (games.some((g) => cache.mine.has(g.id))) cls.push('has-mine');
+      if (items.length === 0) cls.push('is-empty');
+      if (items.some((x) => x.signed)) cls.push('has-mine');
+      const addHere = () => openAdd({ day: isoDate(d) });
       days.push(h('li', { class: cls.join(' ') },
-        h('div', { class: 'vmcal-day-head' },
+        h('div', {
+          class: 'vmcal-day-head', role: 'button', tabindex: 0, title: 'Добавить свою игру на этот день',
+          onclick: addHere,
+          onkeydown: (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              addHere();
+            }
+          },
+        },
           h('span', { class: 'vmcal-dow' }, fmtDow.format(d)),
           h('span', { class: 'vmcal-date' }, fmtDate.format(d)),
           i === 0 ? h('span', { class: 'vmcal-rel' }, 'сегодня') : i === 1 ? h('span', { class: 'vmcal-rel' }, 'завтра') : null,
         ),
-        h('div', { class: 'vmcal-day-body' }, games.map((g) => buildCard(g, cache.mine.get(g.id)))),
+        h('div', { class: 'vmcal-day-body' }, items.map((x) => x.make())),
       ));
     }
     return h('ol', { class: 'vmcal-strip', 'aria-label': 'Ближайшие игры по дням' }, days);
@@ -261,10 +1033,15 @@
     }
     const today = startOfDay(new Date());
     const upcoming = cache.games.filter((g) => new Date(g.startsAt) >= today).sort(byStart);
-    if (upcoming.length === 0) {
-      return [h('p', { class: 'muted tiny vmcal-note' }, 'Календарь: ближайших игр нет.')];
-    }
-    const strip = buildStrip(upcoming, today);
+    const { entries } = loadOwn();
+    // Лента — до последней игры Вестмарша или последней разовой своей игры (повторы ленту не растягивают).
+    let last = today;
+    for (const g of upcoming) last = new Date(Math.max(+last, +startOfDay(new Date(g.startsAt))));
+    for (const e of entries) for (const s of e.sessions) if (!s.every) last = new Date(Math.max(+last, +parseDate(s.date)));
+    const total = Math.min(MAX_DAYS, Math.max(MIN_DAYS, dayDiff(today, last) + 1));
+    const occ = ownOccurrences(entries, today, addDays(today, total));
+    const clashes = findClashes(upcoming, occ);
+    const strip = buildStrip(upcoming, occ, clashes, today, total);
     return [buildHead(upcoming, strip), strip];
   }
 
@@ -385,6 +1162,93 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
 .vmcal-card-meta { color: var(--ink-soft); }
 .vmcal-card-mine { font-weight: 700; color: var(--status-open, #2f6b4f); }
 .vmcal-note { margin: .5rem 0 0; }
+
+/* свои игры и накладки */
+#vmcal, .vmcal-dialog { --vmcal-own: #3e5aa8; --vmcal-own-soft: rgba(62,90,168,.09); --vmcal-on-own: #fff; }
+[data-theme=dark] #vmcal, [data-theme=dark] .vmcal-dialog { --vmcal-own: #a5b4f0; --vmcal-own-soft: rgba(165,180,240,.13); --vmcal-on-own: #151522; }
+.vmcal-add { margin-left: auto; padding: .3rem .85rem; border-radius: 999px; border: 1px dashed var(--vmcal-own); background: var(--vmcal-own-soft);
+  color: var(--vmcal-own); font: inherit; font-size: .82rem; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.vmcal-add:hover { border-style: solid; }
+.vmcal-add + .vmcal-nav { margin-left: 0; }
+.vmcal-day-head { cursor: pointer; }
+.vmcal-day-head:hover, .vmcal-day-head:focus-visible { border-color: var(--vmcal-own); outline: none; }
+button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: inherit; text-align: left; cursor: pointer; }
+.vmcal-card.is-own { border: 1.5px dashed var(--vmcal-own);
+  background: linear-gradient(var(--vmcal-own-soft), var(--vmcal-own-soft)), var(--card-bg); }
+.vmcal-card.is-own:hover { border-style: solid; border-color: var(--vmcal-own); }
+.vmcal-kind { color: var(--vmcal-own); }
+.vmcal-card.is-clash { box-shadow: inset 4px 0 0 var(--danger, #a33); }
+.vmcal-card-clash { font-size: .75rem; font-weight: 700; color: var(--danger, #a33);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* окно добавления */
+.vmcal-dialog { width: min(28rem, calc(100vw - 1.5rem)); max-height: calc(100dvh - 2rem); padding: 0; overflow: auto;
+  border: 1px solid var(--line); border-radius: var(--radius, 12px); background: var(--control-bg-elevated, #fff);
+  color: var(--ink); box-shadow: 0 24px 64px rgba(0,0,0,.35); color-scheme: light; }
+[data-theme=dark] .vmcal-dialog { color-scheme: dark; }
+.vmcal-dialog::backdrop { background: rgba(12,12,20,.5); }
+.vmcal-dialog [hidden] { display: none !important; }
+.vmcal-form { display: grid; gap: .75rem; padding: 1.1rem 1.15rem 1rem; }
+.vmcal-form h3 { margin: 0; font-family: Fraunces, Georgia, serif; font-size: 1.15rem; line-height: 1.25; }
+.vmcal-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: .2rem; padding: .2rem; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface-muted, rgba(0,0,0,.04)); }
+.vmcal-seg button { padding: .45rem .4rem; border: 0; border-radius: 999px; background: transparent; color: var(--ink-soft);
+  font: inherit; font-size: .9rem; font-weight: 600; cursor: pointer; }
+.vmcal-seg button[aria-pressed=true] { background: var(--vmcal-own); color: var(--vmcal-on-own); }
+.vmcal-row { display: grid; grid-template-columns: 1.35fr 1fr .75fr; gap: .6rem; }
+.vmcal-row.two { grid-template-columns: 1fr 1fr; }
+.vmcal-stack { display: grid; gap: .75rem; }
+.vmcal-field { display: grid; gap: .25rem; min-width: 0; font-size: .78rem; font-weight: 600; color: var(--ink-soft); }
+.vmcal-field input, .vmcal-field select, .vmcal-field textarea { box-sizing: border-box; width: 100%; min-width: 0; height: 2.5rem;
+  padding: 0 .6rem; border: 1px solid var(--line-medium, var(--line)); border-radius: 8px; background: var(--control-bg, transparent);
+  color: var(--ink); font: inherit; font-size: 16px; font-weight: 400; }
+.vmcal-field textarea { height: auto; min-height: 4.6rem; padding: .5rem .6rem; line-height: 1.35; resize: vertical; }
+.vmcal-field input:focus, .vmcal-field select:focus, .vmcal-field textarea:focus { outline: 2px solid var(--vmcal-own); outline-offset: -1px; }
+.vmcal-img { display: flex; align-items: center; gap: .75rem; min-height: 2.5rem; }
+.vmcal-img-preview { flex: none; width: 7.5rem; height: 2.5rem; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }
+.vmcal-img-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .6rem; font-weight: 400; }
+.vmcal-img-actions .vmcal-link { margin-left: .2rem; }
+.vmcal-img-status { font-weight: 400; }
+/* кадрирование */
+.vmcal-crop-dialog { width: min(34rem, calc(100vw - 1.5rem)); }
+.vmcal-crop { position: relative; overflow: hidden; border-radius: 10px; background: #111; touch-action: none;
+  cursor: grab; user-select: none; -webkit-user-select: none; }
+.vmcal-crop.is-dragging { cursor: grabbing; }
+.vmcal-crop-img { position: absolute; left: 0; top: 0; max-width: none; max-height: none; transform-origin: 0 0;
+  pointer-events: none; user-select: none; -webkit-user-drag: none; }
+.vmcal-crop-win { position: absolute; border-radius: 4px; outline: 2px solid #fff; pointer-events: none;
+  box-shadow: 0 0 0 100vmax rgba(10,10,18,.6); }
+.vmcal-zoom { display: flex; align-items: center; gap: .6rem; }
+.vmcal-zoom input { flex: 1 1 auto; min-width: 0; accent-color: var(--vmcal-own); }
+.vmcal-zoom .vmcal-btn { flex: none; width: 2.25rem; padding: .3rem 0; font-size: 1.1rem; line-height: 1; }
+.vmcal-btn.small { padding: .35rem .85rem; font-size: .85rem; }
+.vmcal-links { display: flex; flex-wrap: wrap; gap: .25rem 1.1rem; margin-top: -.35rem; font-size: .85rem; }
+.vmcal-empty { display: grid; justify-items: start; gap: .65rem; padding: .85rem .9rem; border: 1px dashed var(--vmcal-own);
+  border-radius: 10px; background: var(--vmcal-own-soft); }
+.vmcal-empty p { margin: 0; font-size: .9rem; line-height: 1.4; }
+.vmcal-entry-head { display: flex; align-items: flex-start; gap: .75rem; font-size: .95rem; }
+.vmcal-entry-head img { flex: none; width: 7.5rem; height: 2.5rem; object-fit: cover; border-radius: 6px; }
+.vmcal-who { margin: .2rem 0 0; font-size: .85rem; }
+.vmcal-desc { margin: .25rem 0 0; font-size: .82rem; line-height: 1.35; color: var(--ink-soft); white-space: pre-line;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.vmcal-hint { margin: 0; font-size: .78rem; color: var(--ink-soft); }
+.vmcal-link { padding: 0; border: 0; background: none; color: var(--vmcal-own); font: inherit; font-weight: 600;
+  text-decoration: underline; cursor: pointer; }
+.vmcal-dialog:focus { outline: none; }
+.vmcal-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .25rem; }
+.vmcal-actions-extra, .vmcal-actions-main { display: flex; flex-wrap: wrap; gap: .5rem; }
+.vmcal-actions-main { margin-left: auto; }
+.vmcal-btn { padding: .5rem 1rem; border-radius: 999px; border: 1px solid var(--line-medium, var(--line)); background: transparent;
+  color: var(--ink); font: inherit; font-size: .9rem; font-weight: 600; cursor: pointer; }
+.vmcal-btn:hover { border-color: var(--vmcal-own); }
+.vmcal-btn.primary { border-color: var(--vmcal-own); background: var(--vmcal-own); color: var(--vmcal-on-own); }
+.vmcal-btn.danger { color: var(--danger, #a33); }
+.vmcal-btn.danger:hover { border-color: var(--danger, #a33); }
+@media (max-width: 480px) {
+  .vmcal-row { grid-template-columns: 1fr 1fr; }
+  .vmcal-row > :first-child { grid-column: 1 / -1; }
+  .vmcal-row.two > :first-child { grid-column: auto; }
+}
 @media (max-width: 720px) {
   main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 1.25rem); }
   #vmcal { margin-inline: .625rem; padding: .7rem .6rem .5rem; }
@@ -400,5 +1264,7 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
   new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
   document.addEventListener('visibilitychange', onReturn);
   window.addEventListener('focus', onReturn);
+  // свои игры поменяли в другой вкладке — перерисовываем
+  window.addEventListener('storage', (e) => { if (e.key === OWN_KEY) render(); });
   schedule();
 })();
