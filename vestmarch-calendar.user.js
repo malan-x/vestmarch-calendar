@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.7.0
+// @version      1.8.0
 // @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад) и кнопка «Влить все ОД».
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1359,31 +1359,54 @@
   const tone = (gain) => (gain >= 1.02 ? 'is-good' : gain <= 0.98 ? 'is-bad' : 'is-even');
   const dtCardTitle = (card) => card.querySelector('.downtime-card-main > strong')?.firstChild?.textContent?.trim() ?? '';
 
-  // Плашка в карточке: итог одной строкой и раскрывающийся список всех проверок выбранного персонажа.
-  function dtCardHint(options, char, title) {
-    const tip = 'Подсказка закладки «Календарь Вестмарша». Учтено: успех +2 прогресса, провал — истощение, натуральная 1 — два истощения; снять истощение стоит 2 ОД.';
+  // Насколько проверка лучше вклада «+1» и как это показать. Проверка выгоднее меньше чем на 10% — «незначительно»,
+  // нейтральный серый, без подсветки кнопок. Выгоднее на 10%+ — от салатового к зелёному (+40% и выше).
+  // Невыгодна — от оранжевого к красному (−60% и ниже), а «+1» подсвечиваем как лучшее действие.
+  const DT_SIGNIFICANT = 0.1;
+  function dtTone(gain) {
+    const d = gain - 1;
+    if (d >= DT_SIGNIFICANT) return { h: Math.round(90 + 40 * Math.min(1, (d - DT_SIGNIFICANT) / 0.3)), s: 60, best: 'check' };
+    if (d > 0.005) return { h: 60, s: 12, best: null };
+    if (d >= -0.005) return { h: 45, s: 8, best: null };
+    return { h: Math.round(35 * Math.max(0, 1 + d / 0.6)), s: 72, best: 'plus' };
+  }
+  const dtToneStyle = (gain) => {
+    const t = dtTone(gain);
+    return `--vmdt-h:${t.h};--vmdt-s:${t.s}%`;
+  };
+  function dtVerdictText(gain) {
+    const d = gain - 1;
+    const p = deltaPct(gain);
+    if (d >= DT_SIGNIFICANT) return `Проверка выгоднее: ${p}`;
+    if (d > 0.005) return `Проверка незначительно выгоднее: ${p}`;
+    if (d >= -0.005) return `Без разницы: ${p}`;
+    return `Проверка невыгоднее: ${p}`;
+  }
+
+  // Подсказка под кнопками карточки: на сколько процентов проверка выгоднее или невыгоднее вклада «+1», и все варианты.
+  function dtVerdict(options, char, title) {
+    const tip = 'Подсказка закладки «Календарь Вестмарша»: на сколько больше (или меньше) прогресса на каждое ОД даёт проверка '
+      + 'лучшим навыком, чем вклад «+1». Учтено: успех +2, провал — истощение, натуральная 1 — два истощения; снять истощение стоит 2 ОД.';
     if (!options.length) {
-      const node = h('div', { class: 'vmdt-card-hint is-even', title: tip }, 'У персонажа нет подходящих навыков и инструментов — остаётся вклад «+1».');
+      const node = h('div', { class: 'vmdt-verdict is-none', title: tip }, 'Проверка недоступна: нет подходящих навыков и инструментов');
       node.dataset.key = node.textContent;
       return node;
     }
     const best = options[0];
-    const cls = tone(best.gain);
-    const badge = cls === 'is-good' ? 'Выгоднее проверка' : cls === 'is-bad' ? 'Выгоднее «+1»' : 'Почти без разницы';
     const exhaustion = Math.max(0, Number(char.exhaustion) || 0);
-    const summary = cls === 'is-good'
-      ? `${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, 10 ОД → ${per10(best.gain)} вместо 10 (${deltaPct(best.gain)})`
-      : `лучшая проверка — ${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, ${deltaPct(best.gain)}`;
-    const rows = options.map((o) => h('li', { class: `vmdt-row ${tone(o.gain)}` },
+    const rows = options.map((o) => h('li', {
+      class: 'vmdt-row',
+      style: dtToneStyle(o.gain),
+      title: `успех ${pct(o.odds.s)}, провал ${pct(o.odds.f)}, натуральная 1 — ${pct(o.odds.c)}; 10 ОД → ${per10(o.gain)} прогресса вместо 10`,
+    },
       h('span', { class: 'vmdt-skill' }, `${o.label} ${signed(o.mod)}`, h('span', { class: 'vmdt-note' }, ` · ${o.note}`)),
-      h('span', { class: 'vmdt-odds', title: `успех ${pct(o.odds.s)}, провал ${pct(o.odds.f)}, натуральная 1 — ${pct(o.odds.c)}` },
-        `успех ${pct(o.odds.s)} · ${per10(o.gain)}/10 ОД`),
       h('b', { class: 'vmdt-delta' }, deltaPct(o.gain)),
     ));
-    const node = h('div', { class: `vmdt-card-hint ${cls}`, title: tip },
-      h('b', { class: 'vmdt-badge' }, badge),
-      ' ',
-      h('span', null, summary, exhaustion > 0 ? ` · с истощением −${exhaustion}` : ''),
+    const node = h('div', { class: 'vmdt-verdict', style: dtToneStyle(best.gain), title: tip },
+      h('div', { class: 'vmdt-vline' },
+        h('b', { class: 'vmdt-vpct' }, dtVerdictText(best.gain)),
+        h('span', { class: 'vmdt-vskill' }, ` · ${best.label} ${signed(best.mod)}${exhaustion > 0 ? ` (с истощением −${exhaustion})` : ''}`),
+      ),
       h('details', {
         class: 'vmdt-more',
         open: dtOpenCards.has(title),
@@ -1393,11 +1416,41 @@
         h('ol', { class: 'vmdt-rows' }, rows),
       ),
     );
-    node.dataset.key = `${cls}|${node.textContent}`;
+    node.dataset.key = `${best.gain.toFixed(4)}|${node.textContent}`;
     return node;
   }
 
-  // Карточки рисует React страницы: дописываем плашку в конец левой колонки и меняем её только при изменении.
+  // Раскраска родных кнопок: «Проверка» — цветом выгоды, а лучшее из двух действий — зелёной обводкой.
+  // Кнопки рисует React: свои пометки держим в data-атрибутах и style (их React не трогает) и меняем только при изменении.
+  const dtCheckButton = (card) => [...card.querySelectorAll('.downtime-card-actions button')].find((b) => b.textContent.trim().startsWith('Проверка')) || null;
+  function dtMark(btn, attr, value) {
+    if (!btn) return;
+    if (value == null) {
+      if (btn.hasAttribute(attr)) btn.removeAttribute(attr);
+    } else if (btn.getAttribute(attr) !== value) {
+      btn.setAttribute(attr, value);
+    }
+  }
+  // state: undefined — данных нет, снимаем пометки; { best } — лучший вариант проверки (null, если проверять нечем).
+  function dtPaintButtons(card, state) {
+    const check = dtCheckButton(card);
+    const plus = dtPlusButton(card);
+    const best = state ? state.best : null;
+    const tone = best ? dtTone(best.gain) : null;
+    dtMark(check, 'data-vmdt-check', tone ? `${tone.h}/${tone.s}` : null);
+    if (check) {
+      const want = tone ? [String(tone.h), `${tone.s}%`] : null;
+      for (const [i, prop] of ['--vmdt-h', '--vmdt-s'].entries()) {
+        const cur = check.style.getPropertyValue(prop);
+        if (want && cur !== want[i]) check.style.setProperty(prop, want[i]);
+        else if (!want && cur) check.style.removeProperty(prop);
+      }
+    }
+    dtMark(check, 'data-vmdt-best', state && tone?.best === 'check' ? '' : null);
+    dtMark(plus, 'data-vmdt-best', state && (!best || tone?.best === 'plus') ? '' : null);
+  }
+
+  // Карточки рисует React страницы: подсказку ставим в правую колонку сразу под кнопками и меняем только при изменении.
   function ensureCardHints() {
     if (!isDowntimePage()) return;
     const cards = [...document.querySelectorAll('li.downtime-card')];
@@ -1407,26 +1460,39 @@
     const extras = char ? dtEnsureExtras(char) : null;
     let errorShown = false;
     for (const card of cards) {
-      const main = card.querySelector('.downtime-card-main');
-      if (!main) continue;
-      const old = main.querySelector(':scope > .vmdt-card-hint');
+      const legacy = card.querySelector('.downtime-card-main > .vmdt-card-hint'); // плашка прошлой версии закладки
+      if (legacy) legacy.remove();
+      const side = card.querySelector('.downtime-card-side');
+      if (!side) continue;
+      const actions = side.querySelector(':scope > .downtime-card-actions');
+      const old = side.querySelector(':scope > .vmdt-verdict');
       let node = null;
+      let state;
       if (dtError && !errorShown) {
-        node = h('div', { class: 'vmdt-card-hint is-even' }, `Подсказка закладки недоступна: ${dtError.message}.`);
+        node = h('div', { class: 'vmdt-verdict is-none' }, `Подсказка закладки недоступна: ${dtError.message}.`);
         node.dataset.key = node.textContent;
         errorShown = true;
       } else if (char && extras) {
         const title = dtCardTitle(card);
         const project = dtBase.projects.find((p) => p.title === title);
-        if (project) node = dtCardHint(dtOptionsFor(project, char, extras), char, title);
+        if (project) {
+          const options = dtOptionsFor(project, char, extras);
+          state = { best: options[0] || null };
+          node = dtVerdict(options, char, title);
+        }
       }
+      dtPaintButtons(card, state);
       if (!node) {
         if (old) old.remove();
         continue;
       }
-      if (old && old.dataset.key === node.dataset.key) continue;
+      if (old && old.dataset.key === node.dataset.key) {
+        if (actions && old.previousElementSibling !== actions) actions.after(old); // React дорисовал кнопки ниже — переставляем
+        continue;
+      }
       if (old) old.remove();
-      main.append(node);
+      if (actions) actions.after(node);
+      else side.append(node);
     }
   }
 
@@ -1652,31 +1718,28 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
 .vmcal-card-mine { font-weight: 700; color: var(--status-open, #2f6b4f); }
 .vmcal-note { margin: .5rem 0 0; }
 
-/* «Простой»: плашка-подсказка в карточках проектов и кнопка «Влить все» */
-.vmdt-card-hint { --vmdt-good: var(--status-open, #2f6b4f); --vmdt-bad: var(--danger, #a33);
-  margin-top: .5rem; padding: .4rem .6rem; border-radius: 8px; border: 1px solid var(--line);
-  border-left-width: 3px; background: var(--surface-muted, rgba(0,0,0,.03)); font-size: .82rem; line-height: 1.4; }
-.vmdt-card-hint.is-good { border-color: var(--vmdt-good); }
-.vmdt-card-hint.is-bad { border-color: var(--vmdt-bad); }
-.vmdt-badge { margin-right: .15rem; }
-.vmdt-card-hint.is-good .vmdt-badge { color: var(--vmdt-good); }
-.vmdt-card-hint.is-bad .vmdt-badge { color: var(--vmdt-bad); }
-.vmdt-more { margin-top: .25rem; }
-.vmdt-more summary { width: fit-content; cursor: pointer; color: var(--ink-soft); }
-.vmdt-rows { list-style: none; margin: .3rem 0 .1rem; padding: 0; display: grid; gap: .1rem; }
-.vmdt-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 3.2rem; gap: .6rem; align-items: baseline;
-  padding: .15rem .35rem; border-radius: 6px; }
-.vmdt-row:nth-child(odd) { background: var(--surface-muted, rgba(0,0,0,.03)); }
+/* «Простой»: подсказка под кнопками карточки, раскраска кнопок, «Влить все» */
+.vmdt-verdict { --vmdt-h: 45; --vmdt-s: 10%; align-self: stretch; margin-top: .5rem; font-size: .84rem; line-height: 1.35; text-align: right; }
+.vmdt-verdict.is-none { color: var(--ink-soft); }
+.vmdt-vpct { font-size: .95rem; color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 30%); }
+.vmdt-vskill { color: var(--ink-soft); }
+.vmdt-more { margin-top: .15rem; }
+.vmdt-more summary { cursor: pointer; color: var(--ink-soft); font-size: .8rem; }
+.vmdt-rows { list-style: none; margin: .3rem 0 0; padding: 0; display: grid; gap: .15rem; text-align: left; }
+.vmdt-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .6rem; align-items: baseline;
+  padding: .15rem .45rem; border-radius: 6px; border-left: 3px solid hsl(var(--vmdt-h) var(--vmdt-s, 70%) 45%);
+  background: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 45% / .09); }
 .vmdt-skill { min-width: 0; }
-.vmdt-note, .vmdt-odds { color: var(--ink-soft); }
-.vmdt-odds { white-space: nowrap; }
-.vmdt-delta { text-align: right; white-space: nowrap; }
-.vmdt-row.is-good .vmdt-delta { color: var(--vmdt-good); }
-.vmdt-row.is-bad .vmdt-delta { color: var(--vmdt-bad); }
+.vmdt-note { color: var(--ink-soft); }
+.vmdt-delta { text-align: right; white-space: nowrap; color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 30%); }
+[data-theme=dark] .vmdt-vpct, [data-theme=dark] .vmdt-delta { color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 68%); }
+.downtime-card .downtime-card-actions button.btn[data-vmdt-check] { border-color: hsl(var(--vmdt-h) var(--vmdt-s, 65%) 42%);
+  color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 27%); background: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 45% / .15); }
+[data-theme=dark] .downtime-card .downtime-card-actions button.btn[data-vmdt-check] { border-color: hsl(var(--vmdt-h) var(--vmdt-s, 60%) 55%);
+  color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 72%); background: hsl(var(--vmdt-h) var(--vmdt-s, 60%) 50% / .2); }
+.downtime-card .downtime-card-actions button.btn[data-vmdt-best] { box-shadow: 0 0 0 2px hsl(130 55% 38%), 0 0 0 5px hsl(130 55% 40% / .2); }
 @media (max-width: 640px) {
-  .vmdt-row { grid-template-columns: minmax(0, 1fr) auto; }
-  .vmdt-odds { grid-column: 1; grid-row: 2; }
-  .vmdt-delta { grid-row: 1 / span 2; align-self: center; }
+  .vmdt-verdict { text-align: left; }
 }
 
 /* свои игры и накладки */
