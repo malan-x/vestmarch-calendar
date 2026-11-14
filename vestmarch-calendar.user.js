@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Лента-календарь над списком игр. Ваши записи подсвечены и вынесены наверх; можно добавить свои ваншоты, модули и кампании и видеть накладки.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -142,6 +142,7 @@
       every,
       until: every && DATE_RE.test(x.until || '') ? x.until : '',
       skip: every && Array.isArray(x.skip) ? x.skip.filter((d) => DATE_RE.test(d)) : [],
+      place: cleanText(x.place, 80), // пусто — место кампании/модуля по умолчанию
     };
   }
 
@@ -380,7 +381,10 @@
           if (day >= to || (until && day > until)) break;
           if (day >= from && !skip.has(isoDate(day))) {
             const start = withTime(day, session.time);
-            out.push({ entry, session, day: isoDate(day), start, end: new Date(+start + session.hours * 3_600_000) });
+            out.push({
+              entry, session, day: isoDate(day), start, end: new Date(+start + session.hours * 3_600_000),
+              place: session.place || entry.place,
+            });
           }
           if (!step) break;
         }
@@ -529,13 +533,13 @@
 
   function buildOwnCard(o, clash) {
     const { entry, session } = o;
-    const parts = [entry.master, entry.place, REPEAT_SHORT[session.every]].filter(Boolean);
+    const parts = [entry.master, o.place, REPEAT_SHORT[session.every]].filter(Boolean);
     if (!parts.length && entry.desc) parts.push(entry.desc.split('\n')[0]);
     const meta = parts.join(' · ');
     const tip = [
       entry.title,
       entry.master && `Мастер: ${entry.master}`,
-      entry.place && `Место: ${entry.place}`,
+      o.place && `Место: ${o.place}`,
       entry.desc && `\n${entry.desc}`,
       '\nНажмите, чтобы изменить',
     ];
@@ -585,24 +589,34 @@
     ...loadOwn().entries.map((e) => e.master).reverse(),
     ...(cache?.games || []).map((g) => g.masterName).sort((a, b) => String(a).localeCompare(String(b), 'ru')),
   ]);
-  const knownPlaces = () => uniqueNames(loadOwn().entries.map((e) => e.place).reverse());
+  const knownPlaces = () => uniqueNames(loadOwn().entries.flatMap((e) => [e.place, ...e.sessions.map((s) => s.place)]).reverse());
 
-  // Мастер и место проведения: обычные поля с подсказками браузера (<datalist>) — вариант можно выбрать или вписать свой.
+  // Поля с подсказками браузера (<datalist>): вариант можно выбрать или вписать свой.
   let listSeq = 0;
-  function masterPlaceFields(e) {
-    const suggest = (value, max, placeholder, options) => {
-      const id = `vmcal-list-${++listSeq}`;
-      return [
-        h('input', { type: 'text', value: value || '', maxlength: max, placeholder, autocomplete: 'off', list: id }),
-        h('datalist', { id }, options.map((v) => h('option', { value: v }))),
-      ];
-    };
-    const [master, masterList] = suggest(e.master, 60, 'Имя мастера', knownMasters());
-    const [place, placeList] = suggest(e.place, 80, 'Discord, клуб…', knownPlaces());
+  function suggestInput(value, max, placeholder, options) {
+    const id = `vmcal-list-${++listSeq}`;
+    return [
+      h('input', { type: 'text', value: value || '', maxlength: max, placeholder, autocomplete: 'off', list: id }),
+      h('datalist', { id }, options.map((v) => h('option', { value: v }))),
+    ];
+  }
+
+  // Мастер и место. У ваншота место своё, у кампании и модуля — место по умолчанию для сессий.
+  function masterPlaceFields(e, placeLabel = 'Место проведения') {
+    const [master, masterList] = suggestInput(e.master, 60, 'Имя мастера', knownMasters());
+    const [place, placeList] = suggestInput(e.place, 80, 'Discord, клуб…', knownPlaces());
     return {
-      node: h('div', { class: 'vmcal-row two' }, field('Мастер', master, masterList), field('Место проведения', place, placeList)),
+      node: h('div', { class: 'vmcal-row two' }, field('Мастер', master, masterList), field(placeLabel, place, placeList)),
       read: () => ({ master: master.value, place: place.value }),
     };
+  }
+
+  // Место конкретной сессии кампании или модуля: пусто — как обычно (место по умолчанию видно серым в поле).
+  function sessionPlaceField(value, fallback) {
+    const [input, list] = suggestInput(value, 80, '', knownPlaces());
+    const setDefault = (v) => { input.placeholder = v ? `Как обычно: ${v}` : 'Discord, клуб…'; };
+    setDefault(fallback);
+    return { node: field('Место проведения', input, list), value: () => input.value, setDefault };
   }
   const linkBtn = (label, onclick) => h('button', { type: 'button', class: 'vmcal-link', onclick }, label);
   // Кнопка действия в окне: если action вернул false (например, отказ в confirm), окно не закрываем.
@@ -790,14 +804,16 @@
     const emptyText = h('p');
     const emptyBtn = h('button', { type: 'button', class: 'vmcal-btn primary', onclick: createEntry });
     const emptyBox = h('div', { class: 'vmcal-empty' }, emptyText, emptyBtn);
-    const sessionBox = h('div', { class: 'vmcal-stack' }, sf.nodes);
+    const sessionPlace = sessionPlaceField('', '');
+    const sessionBox = h('div', { class: 'vmcal-stack' }, sf.nodes, sessionPlace.node);
 
     const dlg = showDialog('Своя игра', [
       h('div', { class: 'vmcal-seg', role: 'group', 'aria-label': 'Тип игры' }, segBtns),
       oneshotBox, seriesBox, emptyBox, sessionBox,
       h('p', { class: 'vmcal-hint' }, 'Хранится только в этом браузере. Игры Вестмарша в то же время будут отмечены ⚠.'),
     ], 'Добавить', () => {
-      const session = { id: newId(), ...sf.read(), skip: [] };
+      // у ваншота место хранится в самой записи, у сессии кампании/модуля — только если отличается от обычного
+      const session = { id: newId(), ...sf.read(), skip: [], place: kind === 'oneshot' ? '' : sessionPlace.value() };
       const entryId = chosen()?.id;
       if (kind !== 'oneshot' && !entryId) return false;
       return updateOwn((st) => {
@@ -824,6 +840,7 @@
       seriesBox.hidden = !series || none;
       emptyBox.hidden = !none;
       sessionBox.hidden = none;
+      sessionPlace.node.hidden = !series; // у ваншота место — в общих полях выше
       submitBtn.hidden = none;
       pick.replaceChildren(...existing.map((x) => h('option', { value: x.id, selected: x.id === opts.entryId }, x.title)));
       const isModule = k === 'module';
@@ -839,6 +856,7 @@
     function syncPick() {
       const entry = chosen();
       if (entry) sf.setHours(entry.hours);
+      sessionPlace.setDefault(entry?.place);
     }
     setKind(kind);
   }
@@ -853,6 +871,7 @@
     let who = null;
     let desc = null;
     let image = null;
+    let place = null;
     let head;
     if (oneshot) {
       title = textInput(entry.title, 80, true);
@@ -861,7 +880,8 @@
       image = imageField(entry.image);
       head = [field('Название', title), who.node, field('Описание', desc), image.node];
     } else {
-      const whoLine = [entry.master && `Мастер: ${entry.master}`, entry.place && `Место: ${entry.place}`].filter(Boolean).join(' · ');
+      const whoLine = [entry.master && `Мастер: ${entry.master}`, entry.place && `Обычно: ${entry.place}`].filter(Boolean).join(' · ');
+      place = sessionPlaceField(session.place, entry.place);
       head = [h('div', { class: 'vmcal-entry-head' },
         entry.image ? h('img', { src: entry.image, alt: '' }) : null,
         h('div', null,
@@ -896,8 +916,8 @@
       }));
     }
 
-    showDialog(oneshot ? 'Ваншот' : 'Сессия', [...head, ...sf.nodes], 'Сохранить', () => {
-      const next = sf.read();
+    showDialog(oneshot ? 'Ваншот' : 'Сессия', [...head, ...sf.nodes, place?.node], 'Сохранить', () => {
+      const next = { ...sf.read(), place: place ? place.value() : '' };
       return withEntry((st, e) => {
         const s = e.sessions.find((x) => x.id === session.id);
         if (!s) return;
@@ -918,7 +938,7 @@
     const kindSel = h('select', null, ['campaign', 'module'].map((k) => h('option', { value: k, selected: base.kind === k }, KIND_TITLE[k])));
     const hours = h('input', { type: 'number', required: true, min: 0.5, max: 24, step: 0.5, value: base.hours, inputmode: 'decimal' });
     const title = textInput(base.title, 80, true);
-    const who = masterPlaceFields(base);
+    const who = masterPlaceFields(base, 'Место по умолчанию');
     const desc = descInput(base.desc);
     const image = imageField(base.image);
     const count = base.sessions.length;
