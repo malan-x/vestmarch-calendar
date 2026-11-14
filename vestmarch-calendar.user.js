@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.5.0
+// @version      1.6.0
 // @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и подсказка на странице «Простой»: когда выгоднее проверка, а когда простой вклад ОД.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1378,6 +1378,61 @@
     for (const det of root.querySelectorAll('details')) {
       if (openTitles.has(det.closest('.vmdt-project')?.querySelector('.vmdt-ptitle')?.textContent)) det.open = true;
     }
+    ensureCardHints();
+  }
+
+  // ---- подсказка прямо в карточке проекта (для персонажа, выбранного на странице) ----
+
+  // Выбор персонажа на странице — <select>, где варианты вида «Имя · 5 ОД · ист. 0».
+  function dtSelectedCharId() {
+    const sel = [...document.querySelectorAll('main select')].find((s) => [...s.options].some((o) => o.textContent.includes('ист.')));
+    return sel ? sel.value : null;
+  }
+  const dtCardTitle = (card) => card.querySelector('.downtime-card-main > strong')?.firstChild?.textContent?.trim() ?? '';
+
+  function dtCardHint({ options }, selId) {
+    if (!options.length) return null;
+    const own = selId ? options.filter((o) => String(o.char.id) === String(selId)) : [];
+    const best = own.length ? own[0] : options[0];
+    const overall = options[0];
+    const cls = tone(best.gain);
+    const badge = cls === 'is-good' ? 'Выгоднее проверка' : cls === 'is-bad' ? 'Выгоднее «+1»' : 'Почти без разницы';
+    const tired = best.exhaustion > 0 ? ` · с истощением −${best.exhaustion}` : '';
+    const detail = cls === 'is-good'
+      ? `${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, 10 ОД → ${per10(best.gain)} вместо 10 (${deltaPct(best.gain)})${tired}`
+      : `лучшая проверка — ${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, ${deltaPct(best.gain)}${tired}`;
+    const alt = overall !== best && overall.gain >= 1.02 && overall.gain - best.gain >= 0.05
+      ? h('span', { class: 'vmdt-alt' }, `Лучший вариант — ${overall.char.name}, ${overall.label} ${signed(overall.mod)} (${deltaPct(overall.gain)})`)
+      : null;
+    const node = h('div', { class: `vmdt-card-hint ${cls}`, title: 'Подсказка закладки «Календарь Вестмарша»: сравнение проверки с вкладом «+1»' },
+      h('b', { class: 'vmdt-badge' }, badge),
+      ' ',
+      h('span', null, `${best.char.name}: ${detail}`),
+      alt,
+    );
+    node.dataset.key = `${cls}|${node.textContent}`;
+    return node;
+  }
+
+  // Карточки рисует React страницы: дописываем подсказку в конец левой колонки и обновляем только при изменении.
+  function ensureCardHints() {
+    if (!isDowntimePage()) return;
+    const ready = dtCache?.loggedIn ? dtCache : null;
+    const selId = ready ? dtSelectedCharId() : null;
+    for (const card of document.querySelectorAll('li.downtime-card')) {
+      const main = card.querySelector('.downtime-card-main');
+      if (!main) continue;
+      const old = main.querySelector(':scope > .vmdt-card-hint');
+      const proj = ready?.projects.find((p) => p.project.title === dtCardTitle(card));
+      const node = proj ? dtCardHint(proj, selId) : null;
+      if (!node) {
+        if (old) old.remove();
+        continue;
+      }
+      if (old && old.dataset.key === node.dataset.key) continue;
+      if (old) old.remove();
+      main.append(node);
+    }
   }
 
   // Панель «Простой» — первая панель внутри <main> с заголовком «Простой».
@@ -1443,6 +1498,7 @@
       scheduled = false;
       ensure();
       ensureDowntime();
+      ensureCardHints();
     });
   }
 
@@ -1514,9 +1570,17 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
 .vmcal-note { margin: .5rem 0 0; }
 
 /* «Простой»: проверка или вклад */
+#vmdt, .vmdt-card-hint { --vmdt-good: var(--status-open, #2f6b4f); --vmdt-bad: var(--danger, #a33); }
 #vmdt { margin: 0 0 1rem; padding: .9rem 1rem .8rem; background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--radius, 12px); box-shadow: var(--shadow, none);
-  --vmdt-good: var(--status-open, #2f6b4f); --vmdt-bad: var(--danger, #a33); }
+  border-radius: var(--radius, 12px); box-shadow: var(--shadow, none); }
+.vmdt-card-hint { margin-top: .5rem; padding: .4rem .6rem; border-radius: 8px; border: 1px solid var(--line);
+  border-left-width: 3px; background: var(--surface-muted, rgba(0,0,0,.03)); font-size: .82rem; line-height: 1.4; }
+.vmdt-card-hint.is-good { border-color: var(--vmdt-good); }
+.vmdt-card-hint.is-bad { border-color: var(--vmdt-bad); }
+.vmdt-badge { margin-right: .15rem; }
+.vmdt-card-hint.is-good .vmdt-badge { color: var(--vmdt-good); }
+.vmdt-card-hint.is-bad .vmdt-badge { color: var(--vmdt-bad); }
+.vmdt-alt { display: block; margin-top: .15rem; color: var(--ink-soft); }
 #vmdt[hidden] { display: none; }
 .vmdt-head { display: flex; align-items: center; gap: .75rem; margin-bottom: .35rem; }
 .vmdt-title { margin: 0; font-family: Fraunces, Georgia, serif; font-size: 1.1rem; }
@@ -1677,6 +1741,10 @@ button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: 
     if (!isDowntimePage() || !document.getElementById(DT_ID)) return;
     const btn = e.target.closest?.('button');
     if (btn && !btn.closest(`#${DT_ID}`)) dtRefreshSoon();
+  }, true);
+  // выбрали на странице другого персонажа — подсказки в карточках про него
+  document.addEventListener('change', (e) => {
+    if (isDowntimePage() && e.target instanceof HTMLSelectElement) schedule();
   }, true);
   schedule();
 })();
