@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.6.0
-// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и подсказка на странице «Простой»: когда выгоднее проверка, а когда простой вклад ОД.
+// @version      1.7.0
+// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад) и кнопка «Влить все ОД».
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
 // @downloadURL  https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1138,17 +1138,22 @@
     if (strip && scroll) strip.scrollLeft = scroll;
   }
 
-  // ---------- «Простой»: что выгоднее — проверка или простой вклад ОД ----------
+  // ---------- «Простой»: подсказки в карточках «Проектов Оплота» ----------
   // Правила проекта Оплота: вклад «+1» — 1 ОД за 1 прогресс. Проверка — 1 ОД: успех +2 прогресса, провал — 1 истощение,
   // натуральная 1 — 2 истощения; снять одно истощение стоит 2 ОД. Натуральная 20 — всегда успех.
-  // Модификатор считаем той же функцией сайта, что и сама страница (владения, экспертиза, бард, порядок, эффекты).
+  // Считаем только для персонажа, выбранного на странице: кнопки карточки тратят именно его ОД.
+  // Модификатор — той же функцией сайта, что и сама страница (владения, экспертиза, бард, порядок, эффекты).
+  // Инструменты предлагаем, только если у персонажа есть владение ими, сам инструмент в инвентаре или мультиинструмент.
 
-  const DT_ID = 'vmdt';
   const DT_REFRESH_MS = 30_000;
   const isDowntimePage = () => location.pathname.replace(/\/+$/, '') === '/downtime';
-  let dtCache = null;   // { loggedIn, chars, projects, notes, at }
+  let dtBase = null;      // { loggedIn, helpers, chars, projects, catalog, at } — общее для всех персонажей
   let dtLoading = null;
   let dtError = null;
+  const dtExtras = new Map();        // id персонажа → { full, mechanics, items, multitool, baseAt } — грузим только выбранного
+  const dtExtrasLoading = new Set();
+  const dtOptionsCache = new Map();  // варианты проверок для пары «персонаж + проект»
+  const dtOpenCards = new Set();     // в каких карточках раскрыт список «Все проверки» (переживает перерисовку и смену персонажа)
 
   // Функции сайта достаём из его же webpack-модулей: так расчёт совпадает со страницей и следует за её правками.
   let wpRequire = null;
@@ -1197,7 +1202,7 @@
     };
   }
 
-  async function dtLoad() {
+  async function dtLoadBase() {
     const helpers = siteHelpers();
     if (!helpers) throw new Error('не нашёл на странице расчёт навыков — похоже, сайт обновился');
     const userId = await fetchUserId();
@@ -1207,39 +1212,84 @@
       rpcNs('downtime', 'FetchStrongholdProjects', []),
       rpcNs('tools', 'FetchToolCatalog', []).catch(() => []),
     ]);
-    const notes = [];
-    if (!helpers.mergeEffects) notes.push('бонусы от эффектов не учтены');
-    if (!helpers.tools) notes.push('проверки инструментами не учтены');
-    const mine = (chars || []).filter((c) => c && c.ownerId === userId && !c.isDead)
-      .sort((a, b) => String(a.name).localeCompare(String(b.name), 'ru'));
-    const people = await Promise.all(mine.map(async (c) => {
-      let mechanics = [];
-      if (helpers.mergeEffects) {
-        try {
-          const fx = await rpcNs('effects', 'FetchCharacterEffects', [c.id]);
-          mechanics = helpers.mergeEffects((fx || [])
-            .filter((e) => e && e.isActive && (e.remainingGames == null || e.remainingGames > 0))
-            .map((e) => e.mechanics));
-        } catch { /* без эффектов */ }
-      }
-      let multitool = false;
-      if (helpers.tools) {
-        try {
-          const items = await rpcNs('economy', 'FetchCharacterItems', [c.id]);
-          multitool = (items || []).some((it) => it && it.attuned && helpers.isMultitool(it.name));
-        } catch { /* без мультиинструмента */ }
-      }
-      return { char: c, full: { ...c, effectMechanics: mechanics }, mechanics, multitool };
-    }));
-    const active = (projects || []).filter((p) => p && (p.status === 'active' || p.isInfinite)
-      && ((p.skills?.length || 0) + (p.tools?.length || 0)) > 0);
     return {
       loggedIn: true,
-      projects: active.map((p) => ({ project: p, options: dtOptions(p, people, helpers, catalog || []) })),
-      people,
-      notes,
+      helpers,
+      chars: (chars || []).filter((c) => c && c.ownerId === userId && !c.isDead),
+      projects: (projects || []).filter((p) => p && (p.status === 'active' || p.isInfinite)
+        && ((p.skills?.length || 0) + (p.tools?.length || 0)) > 0),
+      catalog: catalog || [],
       at: Date.now(),
     };
+  }
+
+  // Эффекты (бонусы к проверкам) и инвентарь (свои инструменты, мультиинструмент) — только для выбранного персонажа.
+  async function dtLoadExtras(base, char) {
+    const { helpers } = base;
+    let mechanics = [];
+    if (helpers.mergeEffects) {
+      try {
+        const fx = await rpcNs('effects', 'FetchCharacterEffects', [char.id]);
+        mechanics = helpers.mergeEffects((fx || [])
+          .filter((e) => e && e.isActive && (e.remainingGames == null || e.remainingGames > 0))
+          .map((e) => e.mechanics));
+      } catch { /* без эффектов */ }
+    }
+    let items = [];
+    try { items = (await rpcNs('economy', 'FetchCharacterItems', [char.id])) || []; } catch { /* без инвентаря */ }
+    const multitool = items.some((it) => it && it.attuned && helpers.isMultitool(it.name));
+    return { full: { ...char, effectMechanics: mechanics }, mechanics, items, multitool };
+  }
+
+  function dtRefresh(force) {
+    if (dtLoading) return dtLoading;
+    if (!force && dtBase && Date.now() - dtBase.at < DT_REFRESH_MS) return Promise.resolve();
+    dtLoading = dtLoadBase()
+      .then((b) => { dtBase = b; dtError = null; dtOptionsCache.clear(); })
+      .catch((e) => { dtError = e; })
+      .finally(() => { dtLoading = null; schedule(); });
+    return dtLoading;
+  }
+  // после действий на странице (проверка, отдых, вклад) истощение и проекты меняются — пересчитываем чуть позже
+  let dtSoonTimer = 0;
+  const dtRefreshSoon = () => {
+    window.clearTimeout(dtSoonTimer);
+    dtSoonTimer = window.setTimeout(() => { if (isDowntimePage()) dtRefresh(true); }, 3000);
+  };
+
+  // Выбор персонажа на странице — <select>, где варианты вида «Имя · 5 ОД · ист. 0».
+  const dtCharSelect = () => document.querySelector('.downtime-char-pick select')
+    || [...document.querySelectorAll('main select')].find((s) => [...s.options].some((o) => o.textContent.includes('ист.'))) || null;
+  const dtSelectedCharId = () => dtCharSelect()?.value || null;
+  function dtCurrentChar() {
+    if (!dtBase?.loggedIn) return null;
+    const id = dtSelectedCharId();
+    if (id) return dtBase.chars.find((c) => String(c.id) === String(id)) || null;
+    return dtBase.chars.length === 1 ? dtBase.chars[0] : null;
+  }
+  // Данные выбранного персонажа: отдаём, что есть (пусть и от прошлой загрузки), и догружаем свежие в фоне.
+  function dtEnsureExtras(char) {
+    const entry = dtExtras.get(char.id) || null;
+    if ((!entry || entry.baseAt !== dtBase.at) && !dtExtrasLoading.has(char.id)) {
+      const base = dtBase;
+      dtExtrasLoading.add(char.id);
+      dtLoadExtras(base, char)
+        .then((x) => dtExtras.set(char.id, { ...x, baseAt: base.at }))
+        .catch(() => dtExtras.set(char.id, { full: { ...char, effectMechanics: [] }, mechanics: [], items: [], multitool: false, baseAt: base.at }))
+        .finally(() => { dtExtrasLoading.delete(char.id); schedule(); });
+    }
+    return entry;
+  }
+  // Сколько ОД у выбранного персонажа: блок «Очки действий» (или текст варианта в списке). ∞ — тестовый персонаж.
+  function dtCurrentAp() {
+    const v = document.querySelector('.downtime-status-ap-value');
+    const head = (v?.firstChild?.textContent || '').trim();
+    if (head === '∞') return Infinity;
+    if (/^\d+$/.test(head)) return Number(head);
+    const txt = dtCharSelect()?.selectedOptions?.[0]?.textContent || '';
+    if (txt.includes('∞')) return Infinity;
+    const m = /(\d+)\s*ОД/.exec(txt);
+    return m ? Number(m[1]) : null;
   }
 
   // Вероятности на d20: натуральная 20 — успех, натуральная 1 — крит. провал, остальное — сравнение с СЛ.
@@ -1251,31 +1301,42 @@
   }
   // Прогресс на одно потраченное ОД с учётом лечения истощения: 2·успех / (1 + 2·провал + 4·крит. провал). У вклада — ровно 1.
   const dtGain = (o) => (2 * o.s) / (1 + 2 * o.f + 4 * o.c);
+  const dtSameName = (a, b) => {
+    const x = String(a || '').trim().toLowerCase();
+    const y = String(b || '').trim().toLowerCase();
+    return !!x && !!y && (x === y || x.startsWith(`${y} `) || x.startsWith(`${y} (`));
+  };
 
-  function dtOptions(project, people, helpers, catalog) {
+  // Варианты проверки проекта для одного персонажа, лучшие сверху.
+  function dtOptionsFor(project, char, extras) {
+    const key = `${dtBase.at}|${extras.baseAt}|${char.id}|${project.id}`;
+    const hit = dtOptionsCache.get(key);
+    if (hit) return hit;
+    const { helpers, catalog } = dtBase;
+    const exhaustion = Math.max(0, Number(char.exhaustion) || 0);
     const out = [];
-    for (const { char, full, mechanics, multitool } of people) {
-      const exhaustion = Math.max(0, Number(char.exhaustion) || 0);
-      for (const skill of project.skills || []) {
+    for (const skill of project.skills || []) {
+      try {
+        const b = helpers.skill(extras.full, skill);
+        const note = b.expertise ? 'экспертиза' : b.trained ? 'владение' : b.jackOfAllTrades ? 'мастер на все руки' : 'без владения';
+        out.push({ label: skill, note, mod: (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion });
+      } catch { /* навык, которого функция сайта не знает */ }
+    }
+    if (helpers.tools) {
+      const T = helpers.tools;
+      for (const name of project.tools || []) {
+        const tool = catalog.find((t) => t && t.name === name);
+        if (!tool) continue;
         try {
-          const b = helpers.skill(full, skill);
-          const mod = (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion;
-          out.push({ char, label: skill, mod, exhaustion });
-        } catch { /* навык, которого функция сайта не знает */ }
-      }
-      if (helpers.tools) {
-        const T = helpers.tools;
-        for (const name of project.tools || []) {
-          const tool = catalog.find((t) => t && t.name === name);
-          if (!tool) continue;
-          try {
-            const abilityMod = tool.abilityKey ? T.J3(T.T_(full)[tool.abilityKey]) : 0;
-            const proficient = multitool || T.HE(full).includes(tool.name);
-            const pb = proficient ? T.Zm(char.level ?? 1) : 0;
-            const bonus = Number(T.$R(mechanics, 'tool', tool.name)) || 0;
-            out.push({ char, label: `${tool.name} (инстр.)`, mod: abilityMod + pb + bonus - exhaustion, exhaustion });
-          } catch { /* пропускаем */ }
-        }
+          const proficient = extras.multitool || T.HE(extras.full).includes(tool.name);
+          const owned = extras.items.some((it) => dtSameName(it?.name, tool.name));
+          if (!proficient && !owned) continue; // ни владения, ни инструмента — такой проверки у персонажа нет
+          const abilityMod = tool.abilityKey ? T.J3(T.T_(extras.full)[tool.abilityKey]) : 0;
+          const pb = proficient ? T.Zm(char.level ?? 1) : 0;
+          const bonus = Number(T.$R(extras.mechanics, 'tool', tool.name)) || 0;
+          const note = extras.multitool ? 'мультиинструмент' : proficient ? 'владение' : 'свой, без владения';
+          out.push({ label: tool.name, note, mod: abilityMod + pb + bonus - exhaustion });
+        } catch { /* пропускаем */ }
       }
     }
     const dc = Number(project.checkDc) || 0;
@@ -1283,25 +1344,10 @@
       o.odds = dtOdds(o.mod, dc);
       o.gain = dtGain(o.odds);
     }
-    return out.sort((a, b) => b.gain - a.gain || b.mod - a.mod);
+    out.sort((a, b) => b.gain - a.gain || b.mod - a.mod);
+    dtOptionsCache.set(key, out);
+    return out;
   }
-
-  function dtRefresh(force) {
-    if (dtLoading) return dtLoading;
-    if (!force && dtCache && Date.now() - dtCache.at < DT_REFRESH_MS) return Promise.resolve(dtCache);
-    dtLoading = dtLoad()
-      .then((d) => { dtCache = d; dtError = null; })
-      .catch((e) => { dtError = e; })
-      .finally(() => { dtLoading = null; dtRender(); });
-    dtRender();
-    return dtLoading;
-  }
-  // после действий на странице (проверка, отдых, вклад) истощение и проекты меняются — пересчитываем чуть позже
-  let dtSoonTimer = 0;
-  const dtRefreshSoon = () => {
-    window.clearTimeout(dtSoonTimer);
-    dtSoonTimer = window.setTimeout(() => { if (document.getElementById(DT_ID)) dtRefresh(true); }, 3000);
-  };
 
   const signed = (n) => (n >= 0 ? `+${n}` : `−${Math.abs(n)}`);
   const pct = (x) => `${Math.round(x * 100)}%`;
@@ -1311,120 +1357,69 @@
     return d === 0 ? '±0%' : `${d > 0 ? '+' : '−'}${Math.abs(d)}%`;
   };
   const tone = (gain) => (gain >= 1.02 ? 'is-good' : gain <= 0.98 ? 'is-bad' : 'is-even');
-
-  function dtVerdict(best) {
-    if (!best) return h('p', { class: 'vmdt-verdict is-even' }, 'Подходящих навыков у ваших персонажей не нашлось — остаётся вклад «+1».');
-    const who = h('b', null, `${best.char.name} — ${best.label} ${signed(best.mod)}`);
-    const tail = ` (успех ${pct(best.odds.s)}). 10 ОД ≈ ${per10(best.gain)} прогресса вместо 10 (${deltaPct(best.gain)}).`;
-    if (best.gain >= 1.02) return h('p', { class: 'vmdt-verdict is-good' }, 'Выгоднее проверка: ', who, tail);
-    if (best.gain <= 0.98) return h('p', { class: 'vmdt-verdict is-bad' }, 'Выгоднее вклад «+1». Лучшая проверка — ', who, tail);
-    return h('p', { class: 'vmdt-verdict is-even' }, 'Примерно одинаково. Лучшая проверка — ', who, tail);
-  }
-
-  function dtProjectNode({ project, options }) {
-    const rows = options.map((o) => h('li', { class: `vmdt-row ${tone(o.gain)}` },
-      h('span', { class: 'vmdt-who' }, o.char.name),
-      h('span', { class: 'vmdt-skill' }, `${o.label} ${signed(o.mod)}`),
-      h('span', { class: 'vmdt-odds', title: `успех ${pct(o.odds.s)}, провал ${pct(o.odds.f)}, натуральная 1 — ${pct(o.odds.c)}` }, `успех ${pct(o.odds.s)}`),
-      h('span', { class: 'vmdt-gain' }, `${per10(o.gain)} / 10 ОД`),
-      h('b', { class: 'vmdt-delta' }, deltaPct(o.gain)),
-    ));
-    return h('li', { class: 'vmdt-project' },
-      h('div', { class: 'vmdt-ptop' },
-        h('b', { class: 'vmdt-ptitle' }, project.title || 'Проект'),
-        h('span', { class: 'vmdt-chip' }, `СЛ ${project.checkDc}`),
-      ),
-      dtVerdict(options[0]),
-      options.length > 1 ? h('details', { class: 'vmdt-more' },
-        h('summary', null, `Все варианты (${options.length})`),
-        h('ol', { class: 'vmdt-rows' }, rows),
-      ) : null,
-    );
-  }
-
-  function dtBuild() {
-    if (!dtCache) {
-      return [h('p', { class: 'vmdt-note' }, dtError ? `Не удалось посчитать: ${dtError.message}` : 'Считаю шансы…')];
-    }
-    const d = dtCache;
-    const head = h('div', { class: 'vmdt-head' },
-      h('h2', { class: 'vmdt-title' }, 'Проверка или вклад?'),
-      h('button', { type: 'button', class: 'vmdt-refresh', disabled: !!dtLoading, onclick: () => dtRefresh(true) }, dtLoading ? 'Считаю…' : 'Пересчитать'),
-    );
-    const lead = h('p', { class: 'vmdt-lead' },
-      'Сколько прогресса дают 10 ОД, если делать проверки, против вклада «+1» (10 ОД = 10 прогресса). ',
-      'Учтено: успех +2, провал — истощение, натуральная 1 — два истощения; снять истощение стоит 2 ОД.');
-    if (!d.people.length) return [head, h('p', { class: 'vmdt-note' }, 'Нет живых персонажей — считать не для кого.')];
-    const tired = d.people.filter((p) => (Number(p.char.exhaustion) || 0) > 0).map((p) => h('p', { class: 'vmdt-warn' },
-      `${p.char.name}: истощение ${p.char.exhaustion} — броски уже со штрафом −${p.char.exhaustion}. `,
-      'Пока оно висит, проверки хуже; отдых снимает 1 истощение за 2 ОД.'));
-    const list = d.projects.length
-      ? h('ol', { class: 'vmdt-list' }, d.projects.map(dtProjectNode))
-      : h('p', { class: 'vmdt-note' }, 'Сейчас нет активных проектов, в которые можно вкладываться проверкой.');
-    const notes = d.notes.length ? h('p', { class: 'vmdt-note' }, `Не удалось учесть: ${d.notes.join('; ')}.`) : null;
-    return [head, lead, ...tired, list, notes];
-  }
-
-  function dtRender() {
-    const root = document.getElementById(DT_ID);
-    if (!root) return;
-    if (dtCache && !dtCache.loggedIn) {
-      root.hidden = true; // страница сама просит войти
-      return;
-    }
-    root.hidden = false;
-    const openTitles = new Set([...root.querySelectorAll('details[open]')].map((x) => x.closest('.vmdt-project')?.querySelector('.vmdt-ptitle')?.textContent));
-    root.replaceChildren(...dtBuild().filter(Boolean)); // replaceChildren превратил бы null в текст «null»
-    for (const det of root.querySelectorAll('details')) {
-      if (openTitles.has(det.closest('.vmdt-project')?.querySelector('.vmdt-ptitle')?.textContent)) det.open = true;
-    }
-    ensureCardHints();
-  }
-
-  // ---- подсказка прямо в карточке проекта (для персонажа, выбранного на странице) ----
-
-  // Выбор персонажа на странице — <select>, где варианты вида «Имя · 5 ОД · ист. 0».
-  function dtSelectedCharId() {
-    const sel = [...document.querySelectorAll('main select')].find((s) => [...s.options].some((o) => o.textContent.includes('ист.')));
-    return sel ? sel.value : null;
-  }
   const dtCardTitle = (card) => card.querySelector('.downtime-card-main > strong')?.firstChild?.textContent?.trim() ?? '';
 
-  function dtCardHint({ options }, selId) {
-    if (!options.length) return null;
-    const own = selId ? options.filter((o) => String(o.char.id) === String(selId)) : [];
-    const best = own.length ? own[0] : options[0];
-    const overall = options[0];
+  // Плашка в карточке: итог одной строкой и раскрывающийся список всех проверок выбранного персонажа.
+  function dtCardHint(options, char, title) {
+    const tip = 'Подсказка закладки «Календарь Вестмарша». Учтено: успех +2 прогресса, провал — истощение, натуральная 1 — два истощения; снять истощение стоит 2 ОД.';
+    if (!options.length) {
+      const node = h('div', { class: 'vmdt-card-hint is-even', title: tip }, 'У персонажа нет подходящих навыков и инструментов — остаётся вклад «+1».');
+      node.dataset.key = node.textContent;
+      return node;
+    }
+    const best = options[0];
     const cls = tone(best.gain);
     const badge = cls === 'is-good' ? 'Выгоднее проверка' : cls === 'is-bad' ? 'Выгоднее «+1»' : 'Почти без разницы';
-    const tired = best.exhaustion > 0 ? ` · с истощением −${best.exhaustion}` : '';
-    const detail = cls === 'is-good'
-      ? `${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, 10 ОД → ${per10(best.gain)} вместо 10 (${deltaPct(best.gain)})${tired}`
-      : `лучшая проверка — ${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, ${deltaPct(best.gain)}${tired}`;
-    const alt = overall !== best && overall.gain >= 1.02 && overall.gain - best.gain >= 0.05
-      ? h('span', { class: 'vmdt-alt' }, `Лучший вариант — ${overall.char.name}, ${overall.label} ${signed(overall.mod)} (${deltaPct(overall.gain)})`)
-      : null;
-    const node = h('div', { class: `vmdt-card-hint ${cls}`, title: 'Подсказка закладки «Календарь Вестмарша»: сравнение проверки с вкладом «+1»' },
+    const exhaustion = Math.max(0, Number(char.exhaustion) || 0);
+    const summary = cls === 'is-good'
+      ? `${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, 10 ОД → ${per10(best.gain)} вместо 10 (${deltaPct(best.gain)})`
+      : `лучшая проверка — ${best.label} ${signed(best.mod)}: успех ${pct(best.odds.s)}, ${deltaPct(best.gain)}`;
+    const rows = options.map((o) => h('li', { class: `vmdt-row ${tone(o.gain)}` },
+      h('span', { class: 'vmdt-skill' }, `${o.label} ${signed(o.mod)}`, h('span', { class: 'vmdt-note' }, ` · ${o.note}`)),
+      h('span', { class: 'vmdt-odds', title: `успех ${pct(o.odds.s)}, провал ${pct(o.odds.f)}, натуральная 1 — ${pct(o.odds.c)}` },
+        `успех ${pct(o.odds.s)} · ${per10(o.gain)}/10 ОД`),
+      h('b', { class: 'vmdt-delta' }, deltaPct(o.gain)),
+    ));
+    const node = h('div', { class: `vmdt-card-hint ${cls}`, title: tip },
       h('b', { class: 'vmdt-badge' }, badge),
       ' ',
-      h('span', null, `${best.char.name}: ${detail}`),
-      alt,
+      h('span', null, summary, exhaustion > 0 ? ` · с истощением −${exhaustion}` : ''),
+      h('details', {
+        class: 'vmdt-more',
+        open: dtOpenCards.has(title),
+        ontoggle: (e) => { if (e.currentTarget.open) dtOpenCards.add(title); else dtOpenCards.delete(title); },
+      },
+        h('summary', null, `Все проверки (${options.length})`),
+        h('ol', { class: 'vmdt-rows' }, rows),
+      ),
     );
     node.dataset.key = `${cls}|${node.textContent}`;
     return node;
   }
 
-  // Карточки рисует React страницы: дописываем подсказку в конец левой колонки и обновляем только при изменении.
+  // Карточки рисует React страницы: дописываем плашку в конец левой колонки и меняем её только при изменении.
   function ensureCardHints() {
     if (!isDowntimePage()) return;
-    const ready = dtCache?.loggedIn ? dtCache : null;
-    const selId = ready ? dtSelectedCharId() : null;
-    for (const card of document.querySelectorAll('li.downtime-card')) {
+    const cards = [...document.querySelectorAll('li.downtime-card')];
+    if (!cards.length) return;
+    if (!dtBase && !dtLoading && !dtError) dtRefresh(false);
+    const char = dtCurrentChar();
+    const extras = char ? dtEnsureExtras(char) : null;
+    let errorShown = false;
+    for (const card of cards) {
       const main = card.querySelector('.downtime-card-main');
       if (!main) continue;
       const old = main.querySelector(':scope > .vmdt-card-hint');
-      const proj = ready?.projects.find((p) => p.project.title === dtCardTitle(card));
-      const node = proj ? dtCardHint(proj, selId) : null;
+      let node = null;
+      if (dtError && !errorShown) {
+        node = h('div', { class: 'vmdt-card-hint is-even' }, `Подсказка закладки недоступна: ${dtError.message}.`);
+        node.dataset.key = node.textContent;
+        errorShown = true;
+      } else if (char && extras) {
+        const title = dtCardTitle(card);
+        const project = dtBase.projects.find((p) => p.title === title);
+        if (project) node = dtCardHint(dtOptionsFor(project, char, extras), char, title);
+      }
       if (!node) {
         if (old) old.remove();
         continue;
@@ -1435,26 +1430,114 @@
     }
   }
 
-  // Панель «Простой» — первая панель внутри <main> с заголовком «Простой».
-  const downtimePanel = () => [...document.querySelectorAll('main section.panel')].find((s) => s.querySelector('h1')?.textContent.trim() === 'Простой') || null;
-  const downtimeReady = () => !!document.querySelector('.downtime-card') || Date.now() - startedAt > HYDRATION_FALLBACK_MS;
+  // ---- «Влить все ОД»: жмём родную кнопку «+1 · 1 ОД» по очереди ----
+  // Не шлём запросы сами: страница обрабатывает каждое нажатие как обычно (списывает ОД, обновляет цифры, пишет сообщения).
+  // После каждого нажатия ждём, пока ОД уменьшатся; если сайт очко не списал — останавливаемся.
 
-  function ensureDowntime() {
-    const existing = document.getElementById(DT_ID);
-    if (!isDowntimePage()) {
-      if (existing) existing.remove();
+  let dtPour = null;        // { title, done, target, abort } — идёт вливание
+  let dtPourResult = null;  // { title, text, until } — короткое «Готово» на кнопке
+
+  const waitUntil = (cond, ms) => new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      let ok = false;
+      try { ok = !!cond(); } catch { /* ждём дальше */ }
+      if (ok) return resolve(true);
+      if (Date.now() - t0 > ms) return resolve(false);
+      setTimeout(tick, 120);
+    };
+    tick();
+  });
+
+  const dtCardByTitle = (title) => [...document.querySelectorAll('li.downtime-card')].find((c) => dtCardTitle(c) === title) || null;
+  const dtPlusButton = (card) => (card
+    ? [...card.querySelectorAll('.downtime-card-actions button')].find((b) => !b.classList.contains('vmdt-pour') && b.textContent.trim().startsWith('+1')) || null
+    : null);
+
+  async function dtPourClick(title) {
+    if (dtPour) {
+      if (dtPour.title === title) {
+        dtPour.abort = true; // второе нажатие — «Стоп»
+        schedule();
+      }
       return;
     }
-    const panel = downtimePanel();
-    if (!panel || !downtimeReady()) return;
-    if (existing && existing.nextElementSibling === panel) return;
-    if (existing) {
-      panel.before(existing);
-      return;
+    const ap = dtCurrentAp();
+    if (!Number.isFinite(ap) || ap < 1) return;
+    const opt = dtCharSelect()?.selectedOptions?.[0]?.textContent || '';
+    const name = opt.split('·')[0].trim();
+    const exhaustion = Number(/ист\.\s*(\d+)/.exec(opt)?.[1] || 0);
+    const char = dtCurrentChar();
+    const extras = char ? dtExtras.get(char.id) : null;
+    const project = char && extras ? dtBase.projects.find((p) => p.title === title) : null;
+    const best = project ? dtOptionsFor(project, char, extras)[0] : null;
+    const lines = [`Влить все ${ap} ОД${name ? ` персонажа ${name}` : ''} в «${title}» простым вкладом (+1 за каждое ОД)?`];
+    if (best && best.gain >= 1.02) {
+      lines.push('', `Подсказка: здесь выгоднее проверка — ${best.label} ${signed(best.mod)}, ${deltaPct(best.gain)} к вкладу.`);
     }
-    panel.before(h('section', { id: DT_ID, class: 'vmdt' }));
-    dtRender();
-    dtRefresh(false);
+    if (exhaustion > 0) lines.push('', `У персонажа истощение ${exhaustion}: снять его можно только за ОД (2 за уровень).`);
+    if (!window.confirm(lines.join('\n'))) return;
+
+    dtPour = { title, done: 0, target: ap, abort: false };
+    schedule();
+    let reason = '';
+    try {
+      while (!dtPour.abort && dtPour.done < dtPour.target) {
+        const before = dtCurrentAp();
+        if (!Number.isFinite(before) || before < 1) break;
+        // кнопка может быть занята прошлым нажатием или перерисована страницей — ищем заново
+        await waitUntil(() => { const b = dtPlusButton(dtCardByTitle(title)); return b && !b.disabled; }, 6000);
+        const plus = dtPlusButton(dtCardByTitle(title));
+        if (!plus || plus.disabled) { reason = 'кнопка «+1» недоступна'; break; }
+        plus.click();
+        const spent = await waitUntil(() => { const a = dtCurrentAp(); return a != null && a < before; }, 12000);
+        if (!spent) { reason = 'сайт не списал ОД'; break; }
+        dtPour.done += 1;
+        schedule();
+      }
+    } finally {
+      const { done, abort } = dtPour;
+      dtPour = null;
+      dtPourResult = {
+        title,
+        text: abort ? `Остановлено: влито ${done}` : reason ? `Влито ${done} — ${reason}` : `Готово: влито ${done}`,
+        until: Date.now() + 4000,
+      };
+      setTimeout(() => { dtPourResult = null; schedule(); }, 4100);
+      schedule();
+      dtRefreshSoon();
+    }
+  }
+
+  // Кнопка «Влить все» в ряду действий карточки — рядом с «+1 · 1 ОД»; текст и доступность обновляем только при изменении.
+  function ensurePourButtons() {
+    if (!isDowntimePage()) return;
+    const ap = dtCurrentAp();
+    for (const card of document.querySelectorAll('li.downtime-card')) {
+      const actions = card.querySelector('.downtime-card-actions');
+      const plus = dtPlusButton(card);
+      const title = dtCardTitle(card);
+      let btn = actions ? actions.querySelector(':scope > .vmdt-pour') : null;
+      const running = dtPour?.title === title;
+      const result = dtPourResult && dtPourResult.title === title && Date.now() < dtPourResult.until ? dtPourResult : null;
+      const show = !!plus && (running || !!result || (Number.isFinite(ap) && ap >= 2));
+      if (!show) {
+        if (btn) btn.remove();
+        continue;
+      }
+      if (!btn) {
+        btn = h('button', { type: 'button', class: 'btn ghost vmdt-pour', onclick: () => dtPourClick(title) });
+        actions.append(btn);
+      }
+      const label = running
+        ? (dtPour.abort ? 'Останавливаю…' : `Стоп · ${dtPour.done}/${dtPour.target}`)
+        : result ? result.text : `Влить все · ${ap} ОД`;
+      if (btn.textContent !== label) btn.textContent = label;
+      const disabled = running ? dtPour.abort : !!result || !!dtPour || plus.disabled;
+      if (btn.disabled !== disabled) btn.disabled = disabled;
+      const tip = running ? 'Остановить вливание' : 'Нажать «+1 · 1 ОД» за каждое оставшееся очко действий';
+      if (btn.title !== tip) btn.title = tip;
+    }
   }
 
   // ---------- встраивание в страницу ----------
@@ -1497,15 +1580,15 @@
     requestAnimationFrame(() => {
       scheduled = false;
       ensure();
-      ensureDowntime();
       ensureCardHints();
+      ensurePourButtons();
     });
   }
 
   const onReturn = () => {
     if (document.visibilityState !== 'visible') return;
     if (isGamesPage() && document.getElementById(ROOT_ID)) refresh(false);
-    if (isDowntimePage() && document.getElementById(DT_ID)) dtRefresh(false);
+    if (isDowntimePage() && document.querySelector('li.downtime-card')) dtRefresh(false);
   };
 
   // Цвета берём из переменных темы сайта — так блок сам подстраивается под светлую и тёмную тему.
@@ -1569,51 +1652,31 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
 .vmcal-card-mine { font-weight: 700; color: var(--status-open, #2f6b4f); }
 .vmcal-note { margin: .5rem 0 0; }
 
-/* «Простой»: проверка или вклад */
-#vmdt, .vmdt-card-hint { --vmdt-good: var(--status-open, #2f6b4f); --vmdt-bad: var(--danger, #a33); }
-#vmdt { margin: 0 0 1rem; padding: .9rem 1rem .8rem; background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--radius, 12px); box-shadow: var(--shadow, none); }
-.vmdt-card-hint { margin-top: .5rem; padding: .4rem .6rem; border-radius: 8px; border: 1px solid var(--line);
+/* «Простой»: плашка-подсказка в карточках проектов и кнопка «Влить все» */
+.vmdt-card-hint { --vmdt-good: var(--status-open, #2f6b4f); --vmdt-bad: var(--danger, #a33);
+  margin-top: .5rem; padding: .4rem .6rem; border-radius: 8px; border: 1px solid var(--line);
   border-left-width: 3px; background: var(--surface-muted, rgba(0,0,0,.03)); font-size: .82rem; line-height: 1.4; }
 .vmdt-card-hint.is-good { border-color: var(--vmdt-good); }
 .vmdt-card-hint.is-bad { border-color: var(--vmdt-bad); }
 .vmdt-badge { margin-right: .15rem; }
 .vmdt-card-hint.is-good .vmdt-badge { color: var(--vmdt-good); }
 .vmdt-card-hint.is-bad .vmdt-badge { color: var(--vmdt-bad); }
-.vmdt-alt { display: block; margin-top: .15rem; color: var(--ink-soft); }
-#vmdt[hidden] { display: none; }
-.vmdt-head { display: flex; align-items: center; gap: .75rem; margin-bottom: .35rem; }
-.vmdt-title { margin: 0; font-family: Fraunces, Georgia, serif; font-size: 1.1rem; }
-.vmdt-refresh { margin-left: auto; padding: .3rem .8rem; border-radius: 999px; border: 1px solid var(--line-medium, var(--line));
-  background: transparent; color: var(--ink); font: inherit; font-size: .82rem; font-weight: 600; cursor: pointer; }
-.vmdt-refresh:disabled { opacity: .6; cursor: default; }
-.vmdt-lead, .vmdt-note { margin: 0 0 .6rem; font-size: .82rem; color: var(--ink-soft); }
-.vmdt-warn { margin: 0 0 .6rem; padding: .45rem .65rem; border-radius: 8px; font-size: .85rem;
-  border: 1px solid var(--vmdt-bad); background: rgba(160,60,60,.07); }
-.vmdt-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
-.vmdt-project { padding: .6rem .7rem; border: 1px solid var(--line); border-radius: 10px; background: var(--card-bg); }
-.vmdt-ptop { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-.vmdt-ptitle { font-size: .98rem; }
-.vmdt-chip { padding: .05rem .5rem; border-radius: 999px; border: 1px solid var(--line); font-size: .78rem; color: var(--ink-soft); }
-.vmdt-verdict { margin: .35rem 0 0; padding-left: .6rem; border-left: 3px solid var(--line); font-size: .9rem; }
-.vmdt-verdict.is-good { border-color: var(--vmdt-good); }
-.vmdt-verdict.is-bad { border-color: var(--vmdt-bad); }
-.vmdt-more { margin-top: .4rem; font-size: .85rem; }
-.vmdt-more summary { cursor: pointer; color: var(--ink-soft); }
-.vmdt-rows { list-style: none; margin: .35rem 0 0; padding: 0; display: grid; gap: .2rem; }
-.vmdt-row { display: grid; grid-template-columns: minmax(6rem, 1fr) minmax(8rem, 1.4fr) 6.5rem 6.5rem 3.5rem; gap: .5rem;
-  align-items: baseline; padding: .2rem .35rem; border-radius: 6px; }
+.vmdt-more { margin-top: .25rem; }
+.vmdt-more summary { width: fit-content; cursor: pointer; color: var(--ink-soft); }
+.vmdt-rows { list-style: none; margin: .3rem 0 .1rem; padding: 0; display: grid; gap: .1rem; }
+.vmdt-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 3.2rem; gap: .6rem; align-items: baseline;
+  padding: .15rem .35rem; border-radius: 6px; }
 .vmdt-row:nth-child(odd) { background: var(--surface-muted, rgba(0,0,0,.03)); }
-.vmdt-who, .vmdt-skill { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vmdt-odds, .vmdt-gain { color: var(--ink-soft); white-space: nowrap; }
+.vmdt-skill { min-width: 0; }
+.vmdt-note, .vmdt-odds { color: var(--ink-soft); }
+.vmdt-odds { white-space: nowrap; }
 .vmdt-delta { text-align: right; white-space: nowrap; }
 .vmdt-row.is-good .vmdt-delta { color: var(--vmdt-good); }
 .vmdt-row.is-bad .vmdt-delta { color: var(--vmdt-bad); }
 @media (max-width: 640px) {
-  #vmdt { padding: .75rem .7rem .7rem; }
-  .vmdt-row { grid-template-columns: 1fr auto auto; gap: .1rem .6rem; }
-  .vmdt-who { grid-column: 1 / -1; font-weight: 600; }
-  .vmdt-gain { display: none; }
+  .vmdt-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .vmdt-odds { grid-column: 1; grid-row: 2; }
+  .vmdt-delta { grid-row: 1 / span 2; align-self: center; }
 }
 
 /* свои игры и накладки */
@@ -1738,9 +1801,7 @@ button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: 
   window.addEventListener('storage', (e) => { if (e.key === OWN_KEY) render(); });
   // на «Простое» после нажатий кнопок страницы (проверка, отдых, вклад) пересчитываем подсказку
   document.addEventListener('click', (e) => {
-    if (!isDowntimePage() || !document.getElementById(DT_ID)) return;
-    const btn = e.target.closest?.('button');
-    if (btn && !btn.closest(`#${DT_ID}`)) dtRefreshSoon();
+    if (isDowntimePage() && e.target.closest?.('button')) dtRefreshSoon();
   }, true);
   // выбрали на странице другого персонажа — подсказки в карточках про него
   document.addEventListener('change', (e) => {
