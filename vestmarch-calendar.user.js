@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.3.1
+// @version      1.4.0
 // @description  Лента-календарь над списком игр. Ваши записи подсвечены и вынесены наверх; можно добавить свои ваншоты, модули и кампании и видеть накладки.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -166,13 +166,22 @@
     };
   }
 
+  // Отметка «занят»: { id, from, to, note }; to пусто — один день. Дни сравниваем строками YYYY-MM-DD.
+  function normBusy(x) {
+    if (!x || !DATE_RE.test(x.from)) return null;
+    const to = DATE_RE.test(x.to || '') && x.to > x.from ? x.to : '';
+    return { id: typeof x.id === 'string' ? x.id : newId(), from: x.from, to, note: cleanText(x.note, 120) };
+  }
+  const busyOn = (busy, dayIso) => busy.find((b) => b.from <= dayIso && dayIso <= (b.to || b.from)) || null;
+
   function loadOwn() {
     try {
       const raw = JSON.parse(localStorage.getItem(OWN_KEY) || 'null');
       const entries = (Array.isArray(raw?.entries) ? raw.entries : []).map(normEntry).filter(Boolean);
-      return { entries, lastKind: KINDS.includes(raw?.lastKind) ? raw.lastKind : 'oneshot' };
+      const busy = (Array.isArray(raw?.busy) ? raw.busy : []).map(normBusy).filter(Boolean);
+      return { entries, busy, lastKind: KINDS.includes(raw?.lastKind) ? raw.lastKind : 'oneshot' };
     } catch {
-      return { entries: [], lastKind: 'oneshot' };
+      return { entries: [], busy: [], lastKind: 'oneshot' };
     }
   }
 
@@ -181,7 +190,12 @@
     const store = loadOwn();
     change(store);
     try {
-      localStorage.setItem(OWN_KEY, JSON.stringify({ v: 1, entries: store.entries.map(normEntry).filter(Boolean), lastKind: store.lastKind }));
+      localStorage.setItem(OWN_KEY, JSON.stringify({
+        v: 1,
+        entries: store.entries.map(normEntry).filter(Boolean),
+        busy: store.busy.map(normBusy).filter(Boolean),
+        lastKind: store.lastKind,
+      }));
     } catch (e) {
       alert(e?.name === 'QuotaExceededError'
         ? 'Не удалось сохранить: в браузере кончилось место для этого сайта. Уберите картинки у старых игр или удалите лишние.'
@@ -503,13 +517,17 @@
     return h('div', { class: 'vmcal-card-clash', title: details }, `⚠ Накладка: ${names}`);
   }
 
-  function buildCard(g, signup, clash) {
+  const busyNode = (busy) => h('div', { class: 'vmcal-card-clash', title: busy.note || 'Вы отметили этот день как занятый' },
+    `⛔ Вы заняты${busy.note ? `: ${busy.note}` : ''}`);
+
+  function buildCard(g, signup, clash, busy) {
+    busy = g.status === 'done' ? null : busy;
     const start = new Date(g.startsAt);
     const href = `/games/${g.id}`;
     const img = SHOW_IMAGES ? imageUrl(g) : null;
     const meta = [g.masterName, `ур. ${levelText(g)}`, priceText(g.priceRub)].filter(Boolean).join(' · ');
     return h('a', {
-      class: `vmcal-card status-${g.status}${signup ? ' is-mine' : ''}${clash ? ' is-clash' : ''}`,
+      class: `vmcal-card status-${g.status}${signup ? ' is-mine' : ''}${clash || busy ? ' is-clash' : ''}`,
       href,
       title: g.title,
       onclick: spaNavigate,
@@ -526,12 +544,13 @@
         h('div', { class: 'vmcal-card-title' }, g.title, g.isTest ? h('span', { class: 'muted tiny' }, ' · тест') : null),
         h('div', { class: 'vmcal-card-meta' }, meta),
         signup && h('div', { class: 'vmcal-card-mine', title: mineTitle(signup) }, `✓ ${mineLabel(signup)}`),
+        busy && busyNode(busy),
         clash && clashNode(clash),
       ),
     );
   }
 
-  function buildOwnCard(o, clash) {
+  function buildOwnCard(o, clash, busy) {
     const { entry, session } = o;
     const parts = [entry.master, o.place, REPEAT_SHORT[session.every]].filter(Boolean);
     if (!parts.length && entry.desc) parts.push(entry.desc.split('\n')[0]);
@@ -545,7 +564,7 @@
     ];
     return h('button', {
       type: 'button',
-      class: `vmcal-card is-own${clash ? ' is-clash' : ''}`,
+      class: `vmcal-card is-own${clash || busy ? ' is-clash' : ''}`,
       title: tip.filter(Boolean).join('\n'),
       onclick: () => openSession(o),
     },
@@ -557,9 +576,41 @@
         ),
         h('div', { class: 'vmcal-card-title' }, entry.title),
         meta ? h('div', { class: 'vmcal-card-meta' }, meta) : null,
+        busy && busyNode(busy),
         clash && clashNode(clash),
       ),
     );
+  }
+
+  // Окно дня (клик по заголовку дня): отметка «занят» с заметкой, при желании на несколько дней; оттуда же — своя игра.
+  function openDay(dayIso) {
+    const store = loadOwn();
+    const rec = busyOn(store.busy, dayIso);
+    const day = parseDate(dayIso);
+    const fmtIso = (s) => fmtDate.format(parseDate(s));
+    const check = h('input', { type: 'checkbox', checked: !!rec });
+    const note = textInput(rec?.note || '', 120, false, 'День рождения, командировка…');
+    const until = h('input', { type: 'date', value: rec?.to || '', min: rec?.from || dayIso });
+    const details = h('div', { class: 'vmcal-stack' },
+      field('Заметка для себя', note),
+      field('По какой день (если занят несколько дней)', until),
+    );
+    const sync = () => {
+      details.hidden = !check.checked;
+      until.disabled = !check.checked; // скрытое поле не должно мешать проверке формы
+    };
+    check.addEventListener('change', sync);
+    sync();
+    const dow = fmtDow.format(day);
+    showDialog(`${dow[0].toUpperCase()}${dow.slice(1)}, ${fmtDate.format(day)}`, [
+      h('label', { class: 'vmcal-check' }, check, h('span', null, h('b', null, 'Занят'), ' — в этот день не могу играть')),
+      details,
+      rec?.to ? h('p', { class: 'vmcal-hint' }, `Отметка стоит на ${fmtIso(rec.from)}–${fmtIso(rec.to)}. Если снять галочку, снимется целиком.`) : null,
+      h('div', { class: 'vmcal-day-add' }, linkBtn('＋ Добавить свою игру на этот день', () => openAdd({ day: dayIso }))),
+    ], 'Сохранить', () => updateOwn((st) => {
+      st.busy = st.busy.filter((b) => b.id !== rec?.id);
+      if (check.checked) st.busy.push({ id: rec?.id || newId(), from: rec?.from || dayIso, to: until.value, note: note.value });
+    }));
   }
 
   // ---------- окна добавления и правки своих игр ----------
@@ -999,7 +1050,7 @@
     );
   }
 
-  function buildStrip(upcoming, occ, clashes, today, total) {
+  function buildStrip(upcoming, occ, clashes, busyList, today, total) {
     // В каждом дне сначала «своё» (ваши записи и свои игры), потом остальное; внутри — по времени.
     const byDay = new Map();
     const put = (date, item) => {
@@ -1010,29 +1061,32 @@
     for (const g of upcoming) {
       const start = new Date(g.startsAt);
       const signup = cache.mine.get(g.id);
-      put(start, { at: +start, first: !!signup, signed: !!signup, make: () => buildCard(g, signup, clashes.vm.get(g.id)) });
+      put(start, { at: +start, first: !!signup, signed: !!signup, make: (busy) => buildCard(g, signup, clashes.vm.get(g.id), busy) });
     }
-    for (const o of occ) put(o.start, { at: +o.start, first: true, make: () => buildOwnCard(o, clashes.own.get(o)) });
+    for (const o of occ) put(o.start, { at: +o.start, first: true, make: (busy) => buildOwnCard(o, clashes.own.get(o), busy) });
 
     const days = [];
     for (let i = 0; i < total; i++) {
       const d = addDays(today, i);
+      const iso = isoDate(d);
+      const busy = busyOn(busyList, iso);
       const items = (byDay.get(dayKey(d)) || []).sort((a, b) => (b.first - a.first) || (a.at - b.at));
       const dow = d.getDay();
       const cls = ['vmcal-day'];
       if (i === 0) cls.push('is-today');
       if (dow === 0 || dow === 6) cls.push('is-weekend');
-      if (items.length === 0) cls.push('is-empty');
+      if (items.length === 0 && !busy) cls.push('is-empty');
       if (items.some((x) => x.signed)) cls.push('has-mine');
-      const addHere = () => openAdd({ day: isoDate(d) });
+      if (busy) cls.push('is-busy');
+      const openHere = () => openDay(iso);
       days.push(h('li', { class: cls.join(' ') },
         h('div', {
-          class: 'vmcal-day-head', role: 'button', tabindex: 0, title: 'Добавить свою игру на этот день',
-          onclick: addHere,
+          class: 'vmcal-day-head', role: 'button', tabindex: 0, title: 'Отметить, что заняты, или добавить свою игру',
+          onclick: openHere,
           onkeydown: (e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
-              addHere();
+              openHere();
             }
           },
         },
@@ -1040,7 +1094,13 @@
           h('span', { class: 'vmcal-date' }, fmtDate.format(d)),
           i === 0 ? h('span', { class: 'vmcal-rel' }, 'сегодня') : i === 1 ? h('span', { class: 'vmcal-rel' }, 'завтра') : null,
         ),
-        h('div', { class: 'vmcal-day-body' }, items.map((x) => x.make())),
+        h('div', { class: 'vmcal-day-body' },
+          busy && h('button', { type: 'button', class: 'vmcal-busy', title: 'Изменить отметку', onclick: openHere },
+            h('b', null, '⛔ Занят'),
+            busy.note ? h('span', null, busy.note) : null,
+          ),
+          items.map((x) => x.make(busy)),
+        ),
       ));
     }
     return h('ol', { class: 'vmcal-strip', 'aria-label': 'Ближайшие игры по дням' }, days);
@@ -1053,15 +1113,16 @@
     }
     const today = startOfDay(new Date());
     const upcoming = cache.games.filter((g) => new Date(g.startsAt) >= today).sort(byStart);
-    const { entries } = loadOwn();
-    // Лента — до последней игры Вестмарша или последней разовой своей игры (повторы ленту не растягивают).
+    const { entries, busy } = loadOwn();
+    // Лента — до последней игры Вестмарша, разовой своей игры или отметки «занят» (повторы ленту не растягивают).
     let last = today;
     for (const g of upcoming) last = new Date(Math.max(+last, +startOfDay(new Date(g.startsAt))));
     for (const e of entries) for (const s of e.sessions) if (!s.every) last = new Date(Math.max(+last, +parseDate(s.date)));
+    for (const b of busy) last = new Date(Math.max(+last, +parseDate(b.to || b.from)));
     const total = Math.min(MAX_DAYS, Math.max(MIN_DAYS, dayDiff(today, last) + 1));
     const occ = ownOccurrences(entries, today, addDays(today, total));
     const clashes = findClashes(upcoming, occ);
-    const strip = buildStrip(upcoming, occ, clashes, today, total);
+    const strip = buildStrip(upcoming, occ, clashes, busy, today, total);
     return [buildHead(upcoming, strip), strip];
   }
 
@@ -1184,8 +1245,25 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
 .vmcal-note { margin: .5rem 0 0; }
 
 /* свои игры и накладки */
-#vmcal, .vmcal-dialog { --vmcal-own: #3e5aa8; --vmcal-own-soft: rgba(62,90,168,.09); --vmcal-on-own: #fff; }
-[data-theme=dark] #vmcal, [data-theme=dark] .vmcal-dialog { --vmcal-own: #a5b4f0; --vmcal-own-soft: rgba(165,180,240,.13); --vmcal-on-own: #151522; }
+#vmcal, .vmcal-dialog { --vmcal-own: #3e5aa8; --vmcal-own-soft: rgba(62,90,168,.09); --vmcal-on-own: #fff;
+  --vmcal-busy-soft: rgba(122,46,46,.08); }
+[data-theme=dark] #vmcal, [data-theme=dark] .vmcal-dialog { --vmcal-own: #a5b4f0; --vmcal-own-soft: rgba(165,180,240,.13); --vmcal-on-own: #151522;
+  --vmcal-busy-soft: rgba(224,112,112,.13); }
+/* отметка «занят» */
+.vmcal-day.is-busy .vmcal-day-head { border-color: var(--danger, #a33); background: var(--vmcal-busy-soft); }
+.vmcal-day.is-busy .vmcal-dow { color: var(--danger, #a33); }
+.vmcal-busy { display: grid; gap: .15rem; width: 100%; margin: 0; padding: .45rem .55rem; border: 1.5px dashed var(--danger, #a33);
+  border-radius: var(--radius, 12px); background: var(--vmcal-busy-soft); color: var(--ink); font: inherit; font-size: .8rem;
+  text-align: left; cursor: pointer; }
+.vmcal-busy:hover { border-style: solid; }
+.vmcal-busy b { color: var(--danger, #a33); font-size: .88rem; }
+.vmcal-busy span { color: var(--ink-soft); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.vmcal-check { display: flex; align-items: center; gap: .65rem; padding: .75rem .85rem; border: 1px solid var(--line-medium, var(--line));
+  border-radius: 10px; font-size: .95rem; cursor: pointer; }
+.vmcal-check input { flex: none; width: 1.25rem; height: 1.25rem; margin: 0; accent-color: var(--danger, #a33); }
+.vmcal-check:has(input:checked) { border-color: var(--danger, #a33); background: var(--vmcal-busy-soft); }
+.vmcal-check b { color: var(--danger, #a33); }
+.vmcal-day-add { padding-top: .65rem; border-top: 1px solid var(--line); font-size: .9rem; }
 .vmcal-add { margin-left: auto; padding: .3rem .85rem; border-radius: 999px; border: 1px dashed var(--vmcal-own); background: var(--vmcal-own-soft);
   color: var(--vmcal-own); font: inherit; font-size: .82rem; font-weight: 700; white-space: nowrap; cursor: pointer; }
 .vmcal-add:hover { border-style: solid; }
