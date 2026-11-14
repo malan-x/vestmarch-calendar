@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.4.0
-// @description  Лента-календарь над списком игр. Ваши записи подсвечены и вынесены наверх; можно добавить свои ваншоты, модули и кампании и видеть накладки.
+// @version      1.5.0
+// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и подсказка на странице «Простой»: когда выгоднее проверка, а когда простой вклад ОД.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
 // @downloadURL  https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -56,8 +56,10 @@
     }
   }
 
-  async function rpc(method, args) {
-    const res = await fetch(`/api/backend/games/${method}`, {
+  const rpc = (method, args) => rpcNs('games', method, args);
+
+  async function rpcNs(ns, method, args) {
+    const res = await fetch(`/api/backend/${ns}/${method}`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
@@ -1136,6 +1138,270 @@
     if (strip && scroll) strip.scrollLeft = scroll;
   }
 
+  // ---------- «Простой»: что выгоднее — проверка или простой вклад ОД ----------
+  // Правила проекта Оплота: вклад «+1» — 1 ОД за 1 прогресс. Проверка — 1 ОД: успех +2 прогресса, провал — 1 истощение,
+  // натуральная 1 — 2 истощения; снять одно истощение стоит 2 ОД. Натуральная 20 — всегда успех.
+  // Модификатор считаем той же функцией сайта, что и сама страница (владения, экспертиза, бард, порядок, эффекты).
+
+  const DT_ID = 'vmdt';
+  const DT_REFRESH_MS = 30_000;
+  const isDowntimePage = () => location.pathname.replace(/\/+$/, '') === '/downtime';
+  let dtCache = null;   // { loggedIn, chars, projects, notes, at }
+  let dtLoading = null;
+  let dtError = null;
+
+  // Функции сайта достаём из его же webpack-модулей: так расчёт совпадает со страницей и следует за её правками.
+  let wpRequire = null;
+  function siteRequire() {
+    if (wpRequire) return wpRequire;
+    try {
+      (self.webpackChunk_N_E = self.webpackChunk_N_E || []).push([[`vmdt-${Math.random()}`], {}, (r) => { wpRequire = r; }]);
+    } catch { /* нет webpack — значит, сайт сильно поменялся */ }
+    return wpRequire;
+  }
+  // Модуль по номеру; если номер сменился после обновления сайта — ищем по приметам в исходнике (только среди подходящих).
+  function siteModule(id, keys, hints) {
+    const req = siteRequire();
+    if (!req) return null;
+    const fits = (m) => m && keys.every((k) => typeof m[k] === 'function');
+    try {
+      const m = req(id);
+      if (fits(m)) return m;
+    } catch { /* нет такого модуля */ }
+    if (!hints?.length) return null;
+    for (const [mid, factory] of Object.entries(req.m || {})) {
+      let src = '';
+      try { src = Function.prototype.toString.call(factory); } catch { continue; }
+      if (!hints.every((x) => src.includes(x))) continue;
+      try {
+        const m = req(mid);
+        if (fits(m)) return m;
+      } catch { /* не тот */ }
+    }
+    return null;
+  }
+  function siteHelpers() {
+    const sk = siteModule(68943, ['w7'], ['jackOfAllTrades', 'abilityShort', 'checkBonusTargets']);
+    if (!sk) return null;
+    let tools = null;
+    try {
+      if (['J3', 'T_', 'Zm', 'HE', '$R'].every((k) => typeof sk[k] === 'function') && sk.Zm(5) === 3 && sk.J3(14) === 2) tools = sk;
+    } catch { /* без инструментов */ }
+    const fx = siteModule(51226, ['ed']);
+    const mt = siteModule(85119, ['_s'], ['manifold-tool']);
+    return {
+      skill: sk.w7,
+      tools,
+      mergeEffects: fx ? fx.ed : null,
+      isMultitool: mt ? mt._s : (name) => /мультиинструмент|manifold/i.test(name || ''),
+    };
+  }
+
+  async function dtLoad() {
+    const helpers = siteHelpers();
+    if (!helpers) throw new Error('не нашёл на странице расчёт навыков — похоже, сайт обновился');
+    const userId = await fetchUserId();
+    if (!userId) return { loggedIn: false, at: Date.now() };
+    const [chars, projects, catalog] = await Promise.all([
+      rpcNs('characters', 'FetchCharacters', []),
+      rpcNs('downtime', 'FetchStrongholdProjects', []),
+      rpcNs('tools', 'FetchToolCatalog', []).catch(() => []),
+    ]);
+    const notes = [];
+    if (!helpers.mergeEffects) notes.push('бонусы от эффектов не учтены');
+    if (!helpers.tools) notes.push('проверки инструментами не учтены');
+    const mine = (chars || []).filter((c) => c && c.ownerId === userId && !c.isDead)
+      .sort((a, b) => String(a.name).localeCompare(String(b.name), 'ru'));
+    const people = await Promise.all(mine.map(async (c) => {
+      let mechanics = [];
+      if (helpers.mergeEffects) {
+        try {
+          const fx = await rpcNs('effects', 'FetchCharacterEffects', [c.id]);
+          mechanics = helpers.mergeEffects((fx || [])
+            .filter((e) => e && e.isActive && (e.remainingGames == null || e.remainingGames > 0))
+            .map((e) => e.mechanics));
+        } catch { /* без эффектов */ }
+      }
+      let multitool = false;
+      if (helpers.tools) {
+        try {
+          const items = await rpcNs('economy', 'FetchCharacterItems', [c.id]);
+          multitool = (items || []).some((it) => it && it.attuned && helpers.isMultitool(it.name));
+        } catch { /* без мультиинструмента */ }
+      }
+      return { char: c, full: { ...c, effectMechanics: mechanics }, mechanics, multitool };
+    }));
+    const active = (projects || []).filter((p) => p && (p.status === 'active' || p.isInfinite)
+      && ((p.skills?.length || 0) + (p.tools?.length || 0)) > 0);
+    return {
+      loggedIn: true,
+      projects: active.map((p) => ({ project: p, options: dtOptions(p, people, helpers, catalog || []) })),
+      people,
+      notes,
+      at: Date.now(),
+    };
+  }
+
+  // Вероятности на d20: натуральная 20 — успех, натуральная 1 — крит. провал, остальное — сравнение с СЛ.
+  function dtOdds(mod, dc) {
+    let s = 1;
+    for (let r = 2; r <= 19; r++) if (r + mod >= dc) s++;
+    const c = 1;
+    return { s: s / 20, f: (20 - s - c) / 20, c: c / 20 };
+  }
+  // Прогресс на одно потраченное ОД с учётом лечения истощения: 2·успех / (1 + 2·провал + 4·крит. провал). У вклада — ровно 1.
+  const dtGain = (o) => (2 * o.s) / (1 + 2 * o.f + 4 * o.c);
+
+  function dtOptions(project, people, helpers, catalog) {
+    const out = [];
+    for (const { char, full, mechanics, multitool } of people) {
+      const exhaustion = Math.max(0, Number(char.exhaustion) || 0);
+      for (const skill of project.skills || []) {
+        try {
+          const b = helpers.skill(full, skill);
+          const mod = (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion;
+          out.push({ char, label: skill, mod, exhaustion });
+        } catch { /* навык, которого функция сайта не знает */ }
+      }
+      if (helpers.tools) {
+        const T = helpers.tools;
+        for (const name of project.tools || []) {
+          const tool = catalog.find((t) => t && t.name === name);
+          if (!tool) continue;
+          try {
+            const abilityMod = tool.abilityKey ? T.J3(T.T_(full)[tool.abilityKey]) : 0;
+            const proficient = multitool || T.HE(full).includes(tool.name);
+            const pb = proficient ? T.Zm(char.level ?? 1) : 0;
+            const bonus = Number(T.$R(mechanics, 'tool', tool.name)) || 0;
+            out.push({ char, label: `${tool.name} (инстр.)`, mod: abilityMod + pb + bonus - exhaustion, exhaustion });
+          } catch { /* пропускаем */ }
+        }
+      }
+    }
+    const dc = Number(project.checkDc) || 0;
+    for (const o of out) {
+      o.odds = dtOdds(o.mod, dc);
+      o.gain = dtGain(o.odds);
+    }
+    return out.sort((a, b) => b.gain - a.gain || b.mod - a.mod);
+  }
+
+  function dtRefresh(force) {
+    if (dtLoading) return dtLoading;
+    if (!force && dtCache && Date.now() - dtCache.at < DT_REFRESH_MS) return Promise.resolve(dtCache);
+    dtLoading = dtLoad()
+      .then((d) => { dtCache = d; dtError = null; })
+      .catch((e) => { dtError = e; })
+      .finally(() => { dtLoading = null; dtRender(); });
+    dtRender();
+    return dtLoading;
+  }
+  // после действий на странице (проверка, отдых, вклад) истощение и проекты меняются — пересчитываем чуть позже
+  let dtSoonTimer = 0;
+  const dtRefreshSoon = () => {
+    window.clearTimeout(dtSoonTimer);
+    dtSoonTimer = window.setTimeout(() => { if (document.getElementById(DT_ID)) dtRefresh(true); }, 3000);
+  };
+
+  const signed = (n) => (n >= 0 ? `+${n}` : `−${Math.abs(n)}`);
+  const pct = (x) => `${Math.round(x * 100)}%`;
+  const per10 = (gain) => (Math.round(gain * 100) / 10).toLocaleString('ru-RU', { maximumFractionDigits: 1 });
+  const deltaPct = (gain) => {
+    const d = Math.round((gain - 1) * 100);
+    return d === 0 ? '±0%' : `${d > 0 ? '+' : '−'}${Math.abs(d)}%`;
+  };
+  const tone = (gain) => (gain >= 1.02 ? 'is-good' : gain <= 0.98 ? 'is-bad' : 'is-even');
+
+  function dtVerdict(best) {
+    if (!best) return h('p', { class: 'vmdt-verdict is-even' }, 'Подходящих навыков у ваших персонажей не нашлось — остаётся вклад «+1».');
+    const who = h('b', null, `${best.char.name} — ${best.label} ${signed(best.mod)}`);
+    const tail = ` (успех ${pct(best.odds.s)}). 10 ОД ≈ ${per10(best.gain)} прогресса вместо 10 (${deltaPct(best.gain)}).`;
+    if (best.gain >= 1.02) return h('p', { class: 'vmdt-verdict is-good' }, 'Выгоднее проверка: ', who, tail);
+    if (best.gain <= 0.98) return h('p', { class: 'vmdt-verdict is-bad' }, 'Выгоднее вклад «+1». Лучшая проверка — ', who, tail);
+    return h('p', { class: 'vmdt-verdict is-even' }, 'Примерно одинаково. Лучшая проверка — ', who, tail);
+  }
+
+  function dtProjectNode({ project, options }) {
+    const rows = options.map((o) => h('li', { class: `vmdt-row ${tone(o.gain)}` },
+      h('span', { class: 'vmdt-who' }, o.char.name),
+      h('span', { class: 'vmdt-skill' }, `${o.label} ${signed(o.mod)}`),
+      h('span', { class: 'vmdt-odds', title: `успех ${pct(o.odds.s)}, провал ${pct(o.odds.f)}, натуральная 1 — ${pct(o.odds.c)}` }, `успех ${pct(o.odds.s)}`),
+      h('span', { class: 'vmdt-gain' }, `${per10(o.gain)} / 10 ОД`),
+      h('b', { class: 'vmdt-delta' }, deltaPct(o.gain)),
+    ));
+    return h('li', { class: 'vmdt-project' },
+      h('div', { class: 'vmdt-ptop' },
+        h('b', { class: 'vmdt-ptitle' }, project.title || 'Проект'),
+        h('span', { class: 'vmdt-chip' }, `СЛ ${project.checkDc}`),
+      ),
+      dtVerdict(options[0]),
+      options.length > 1 ? h('details', { class: 'vmdt-more' },
+        h('summary', null, `Все варианты (${options.length})`),
+        h('ol', { class: 'vmdt-rows' }, rows),
+      ) : null,
+    );
+  }
+
+  function dtBuild() {
+    if (!dtCache) {
+      return [h('p', { class: 'vmdt-note' }, dtError ? `Не удалось посчитать: ${dtError.message}` : 'Считаю шансы…')];
+    }
+    const d = dtCache;
+    const head = h('div', { class: 'vmdt-head' },
+      h('h2', { class: 'vmdt-title' }, 'Проверка или вклад?'),
+      h('button', { type: 'button', class: 'vmdt-refresh', disabled: !!dtLoading, onclick: () => dtRefresh(true) }, dtLoading ? 'Считаю…' : 'Пересчитать'),
+    );
+    const lead = h('p', { class: 'vmdt-lead' },
+      'Сколько прогресса дают 10 ОД, если делать проверки, против вклада «+1» (10 ОД = 10 прогресса). ',
+      'Учтено: успех +2, провал — истощение, натуральная 1 — два истощения; снять истощение стоит 2 ОД.');
+    if (!d.people.length) return [head, h('p', { class: 'vmdt-note' }, 'Нет живых персонажей — считать не для кого.')];
+    const tired = d.people.filter((p) => (Number(p.char.exhaustion) || 0) > 0).map((p) => h('p', { class: 'vmdt-warn' },
+      `${p.char.name}: истощение ${p.char.exhaustion} — броски уже со штрафом −${p.char.exhaustion}. `,
+      'Пока оно висит, проверки хуже; отдых снимает 1 истощение за 2 ОД.'));
+    const list = d.projects.length
+      ? h('ol', { class: 'vmdt-list' }, d.projects.map(dtProjectNode))
+      : h('p', { class: 'vmdt-note' }, 'Сейчас нет активных проектов, в которые можно вкладываться проверкой.');
+    const notes = d.notes.length ? h('p', { class: 'vmdt-note' }, `Не удалось учесть: ${d.notes.join('; ')}.`) : null;
+    return [head, lead, ...tired, list, notes];
+  }
+
+  function dtRender() {
+    const root = document.getElementById(DT_ID);
+    if (!root) return;
+    if (dtCache && !dtCache.loggedIn) {
+      root.hidden = true; // страница сама просит войти
+      return;
+    }
+    root.hidden = false;
+    const openTitles = new Set([...root.querySelectorAll('details[open]')].map((x) => x.closest('.vmdt-project')?.querySelector('.vmdt-ptitle')?.textContent));
+    root.replaceChildren(...dtBuild().filter(Boolean)); // replaceChildren превратил бы null в текст «null»
+    for (const det of root.querySelectorAll('details')) {
+      if (openTitles.has(det.closest('.vmdt-project')?.querySelector('.vmdt-ptitle')?.textContent)) det.open = true;
+    }
+  }
+
+  // Панель «Простой» — первая панель внутри <main> с заголовком «Простой».
+  const downtimePanel = () => [...document.querySelectorAll('main section.panel')].find((s) => s.querySelector('h1')?.textContent.trim() === 'Простой') || null;
+  const downtimeReady = () => !!document.querySelector('.downtime-card') || Date.now() - startedAt > HYDRATION_FALLBACK_MS;
+
+  function ensureDowntime() {
+    const existing = document.getElementById(DT_ID);
+    if (!isDowntimePage()) {
+      if (existing) existing.remove();
+      return;
+    }
+    const panel = downtimePanel();
+    if (!panel || !downtimeReady()) return;
+    if (existing && existing.nextElementSibling === panel) return;
+    if (existing) {
+      panel.before(existing);
+      return;
+    }
+    panel.before(h('section', { id: DT_ID, class: 'vmdt' }));
+    dtRender();
+    dtRefresh(false);
+  }
+
   // ---------- встраивание в страницу ----------
 
   const isGamesPage = () => location.pathname.replace(/\/+$/, '') === '/games';
@@ -1176,11 +1442,14 @@
     requestAnimationFrame(() => {
       scheduled = false;
       ensure();
+      ensureDowntime();
     });
   }
 
   const onReturn = () => {
-    if (document.visibilityState === 'visible' && isGamesPage() && document.getElementById(ROOT_ID)) refresh(false);
+    if (document.visibilityState !== 'visible') return;
+    if (isGamesPage() && document.getElementById(ROOT_ID)) refresh(false);
+    if (isDowntimePage() && document.getElementById(DT_ID)) dtRefresh(false);
   };
 
   // Цвета берём из переменных темы сайта — так блок сам подстраивается под светлую и тёмную тему.
@@ -1243,6 +1512,45 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-
 .vmcal-card-meta { color: var(--ink-soft); }
 .vmcal-card-mine { font-weight: 700; color: var(--status-open, #2f6b4f); }
 .vmcal-note { margin: .5rem 0 0; }
+
+/* «Простой»: проверка или вклад */
+#vmdt { margin: 0 0 1rem; padding: .9rem 1rem .8rem; background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius, 12px); box-shadow: var(--shadow, none);
+  --vmdt-good: var(--status-open, #2f6b4f); --vmdt-bad: var(--danger, #a33); }
+#vmdt[hidden] { display: none; }
+.vmdt-head { display: flex; align-items: center; gap: .75rem; margin-bottom: .35rem; }
+.vmdt-title { margin: 0; font-family: Fraunces, Georgia, serif; font-size: 1.1rem; }
+.vmdt-refresh { margin-left: auto; padding: .3rem .8rem; border-radius: 999px; border: 1px solid var(--line-medium, var(--line));
+  background: transparent; color: var(--ink); font: inherit; font-size: .82rem; font-weight: 600; cursor: pointer; }
+.vmdt-refresh:disabled { opacity: .6; cursor: default; }
+.vmdt-lead, .vmdt-note { margin: 0 0 .6rem; font-size: .82rem; color: var(--ink-soft); }
+.vmdt-warn { margin: 0 0 .6rem; padding: .45rem .65rem; border-radius: 8px; font-size: .85rem;
+  border: 1px solid var(--vmdt-bad); background: rgba(160,60,60,.07); }
+.vmdt-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
+.vmdt-project { padding: .6rem .7rem; border: 1px solid var(--line); border-radius: 10px; background: var(--card-bg); }
+.vmdt-ptop { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+.vmdt-ptitle { font-size: .98rem; }
+.vmdt-chip { padding: .05rem .5rem; border-radius: 999px; border: 1px solid var(--line); font-size: .78rem; color: var(--ink-soft); }
+.vmdt-verdict { margin: .35rem 0 0; padding-left: .6rem; border-left: 3px solid var(--line); font-size: .9rem; }
+.vmdt-verdict.is-good { border-color: var(--vmdt-good); }
+.vmdt-verdict.is-bad { border-color: var(--vmdt-bad); }
+.vmdt-more { margin-top: .4rem; font-size: .85rem; }
+.vmdt-more summary { cursor: pointer; color: var(--ink-soft); }
+.vmdt-rows { list-style: none; margin: .35rem 0 0; padding: 0; display: grid; gap: .2rem; }
+.vmdt-row { display: grid; grid-template-columns: minmax(6rem, 1fr) minmax(8rem, 1.4fr) 6.5rem 6.5rem 3.5rem; gap: .5rem;
+  align-items: baseline; padding: .2rem .35rem; border-radius: 6px; }
+.vmdt-row:nth-child(odd) { background: var(--surface-muted, rgba(0,0,0,.03)); }
+.vmdt-who, .vmdt-skill { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vmdt-odds, .vmdt-gain { color: var(--ink-soft); white-space: nowrap; }
+.vmdt-delta { text-align: right; white-space: nowrap; }
+.vmdt-row.is-good .vmdt-delta { color: var(--vmdt-good); }
+.vmdt-row.is-bad .vmdt-delta { color: var(--vmdt-bad); }
+@media (max-width: 640px) {
+  #vmdt { padding: .75rem .7rem .7rem; }
+  .vmdt-row { grid-template-columns: 1fr auto auto; gap: .1rem .6rem; }
+  .vmdt-who { grid-column: 1 / -1; font-weight: 600; }
+  .vmdt-gain { display: none; }
+}
 
 /* свои игры и накладки */
 #vmcal, .vmcal-dialog { --vmcal-own: #3e5aa8; --vmcal-own-soft: rgba(62,90,168,.09); --vmcal-on-own: #fff;
@@ -1364,5 +1672,11 @@ button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: 
   window.addEventListener('focus', onReturn);
   // свои игры поменяли в другой вкладке — перерисовываем
   window.addEventListener('storage', (e) => { if (e.key === OWN_KEY) render(); });
+  // на «Простое» после нажатий кнопок страницы (проверка, отдых, вклад) пересчитываем подсказку
+  document.addEventListener('click', (e) => {
+    if (!isDowntimePage() || !document.getElementById(DT_ID)) return;
+    const btn = e.target.closest?.('button');
+    if (btn && !btn.closest(`#${DT_ID}`)) dtRefreshSoon();
+  }, true);
   schedule();
 })();
