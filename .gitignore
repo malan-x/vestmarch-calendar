@@ -1,1 +1,4 @@
 calendar-bookmark.html
+android/build/
+android/out/
+*.jks

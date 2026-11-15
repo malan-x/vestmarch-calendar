@@ -1,0 +1,45 @@
+name: Android-приложение
+
+on:
+  push:
+    branches: [main]
+    paths: ['android/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Собрать APK
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: bash android/build.sh
+
+      - name: Сохранить APK в артефактах сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: vestmarch-plus-apk
+          path: android/out/vestmarch-plus.apk
+          retention-days: 14
+
+      # В релиз — только APK, подписанный постоянным ключом: иначе обновить приложение поверх не получится.
+      - name: Выложить в релиз «app»
+        if: env.APK_SIGNED == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Вестмарш+ ${VERSION_NAME} — неофициальное приложение: сайт Вестмарша со скриптом «Календарь Вестмарша».
+          Установка: скачать vestmarch-plus.apk на телефоне и открыть (Android разрешит установку из браузера после подтверждения).
+          Собрано из коммита ${GITHUB_SHA::7}."
+          if ! gh release view app >/dev/null 2>&1; then
+            gh release create app --title "Android-приложение «Вестмарш+»" --notes "$notes" --latest=false
+          else
+            gh release edit app --notes "$notes"
+          fi
+          gh release upload app android/out/vestmarch-plus.apk --clobber
