@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.8.1
+// @version      1.8.2
 // @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад) и кнопка «Влить все ОД».
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1665,10 +1665,11 @@
 
   // Цвета берём из переменных темы сайта — так блок сам подстраивается под светлую и тёмную тему.
   const CSS_TEXT = `
-/* Лента стоит первой внутри <main> над панелью «Игры». Пока она есть, <main> растягивается на всю ширину,
-   а остальное содержимое остаётся прежней ширины (960px) по центру. */
-main.main:has(> #vmcal) { width: 100%; }
-main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 2rem); margin-inline: auto; }
+/* Лента стоит первой внутри <main> над панелью «Игры». Сайт центрирует колонку 960px боковыми полями <main>
+   (padding-inline: max(1rem, (100% - 960px)/2)). Пока лента есть, поля снимаем с <main> и отдаём остальному
+   содержимому — оно стоит там же, где у сайта, а лента занимает всю ширину. max-width — на случай старой вёрстки. */
+main.main:has(> #vmcal) { --vmcal-gutter: max(1rem, (100% - 960px) / 2); width: 100%; max-width: none; padding-inline: 0; }
+main.main:has(> #vmcal) > :not(#vmcal) { width: auto; max-width: none; margin-inline: var(--vmcal-gutter); }
 #vmcal { margin: 0 clamp(.5rem, 1.5vw, 1.5rem) 1.25rem; padding: .9rem 1rem .6rem; background: var(--surface);
   border: 1px solid var(--line); border-radius: var(--radius, 12px); box-shadow: var(--shadow, none); }
 .vmcal-head { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem .75rem; margin-bottom: .6rem; }
@@ -1852,7 +1853,7 @@ button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: 
   .vmcal-row.two > :first-child { grid-column: auto; }
 }
 @media (max-width: 720px) {
-  main.main:has(> #vmcal) > :not(#vmcal) { width: min(960px, 100% - 1.25rem); }
+  main.main:has(> #vmcal) { --vmcal-gutter: max(.625rem, (100% - 960px) / 2); }
   #vmcal { margin-inline: .625rem; padding: .7rem .6rem .5rem; }
 }
 @media (max-width: 640px) {
