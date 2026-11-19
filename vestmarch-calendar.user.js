@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.8.2
-// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад) и кнопка «Влить все ОД».
+// @version      1.9.0
+// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад) и кнопка «Влить все ОД». Звёздочки у пунктов меню — избранное в шапке.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
 // @downloadURL  https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1640,6 +1640,144 @@
     refresh(false);
   }
 
+  // ---------- избранное в верхнем меню ----------
+  // У каждого пункта меню (и в выпадающих «Мир», «Гильдия»…, и в мобильном) — звёздочка. Отмеченные пункты
+  // показываются в шапке между «Вестмаршем» и меню. Хранится в localStorage сайта, только в этом браузере.
+
+  const FAV_KEY = 'vmcal.fav.v1';
+  const FAV_ID = 'vmfav';
+  let favSig = '';
+
+  function loadFav() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(FAV_KEY) || '[]');
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .filter((f) => f && typeof f.href === 'string' && f.href.startsWith('/'))
+        .map((f) => ({ href: f.href, label: String(f.label || f.href) }));
+    } catch {
+      return [];
+    }
+  }
+  function saveFav(list) {
+    try {
+      localStorage.setItem(FAV_KEY, JSON.stringify(list));
+    } catch {
+      alert('Не удалось сохранить избранное: браузер не даёт писать в хранилище сайта.');
+    }
+  }
+
+  const routePath = (p) => p.replace(/[?#].*$/, '').replace(/\/+$/, '') || '/';
+  // Текст пункта без нашей звёздочки
+  const linkLabel = (a) => [...a.childNodes]
+    .filter((n) => !(n.nodeType === 1 && n.classList.contains('vmfav-star')))
+    .map((n) => n.textContent).join('').replace(/\s+/g, ' ').trim();
+  const menuLinks = () => document.querySelectorAll('header.topbar nav.nav-desktop a[href^="/"], nav.nav-mobile a[href^="/"]');
+  // Вставлять в шапку можно только после гидратации React, иначе он перерисует её и сотрёт наши узлы
+  const reactReady = (el) => Object.keys(el).some((k) => k.startsWith('__reactFiber')) || Date.now() - startedAt > HYDRATION_FALLBACK_MS;
+
+  function toggleFav(a) {
+    const href = a.getAttribute('href');
+    const list = loadFav();
+    const i = list.findIndex((f) => f.href === href);
+    if (i >= 0) list.splice(i, 1);
+    else list.push({ href, label: linkLabel(a) || href });
+    saveFav(list);
+    ensureFavorites();
+  }
+
+  function makeStar(a) {
+    // Звёздочка внутри ссылки: клик гасим, чтобы не сработал переход по пункту и не закрылось меню
+    const act = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleFav(a);
+    };
+    return h('span', {
+      class: 'vmfav-star', role: 'button', tabindex: 0,
+      onclick: act,
+      onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') act(e); },
+    });
+  }
+
+  // Переход без перезагрузки страницы: иначе скрипт, запущенный закладкой, выгрузится
+  function goTo(href) {
+    try {
+      if (typeof window.next?.router?.push === 'function') {
+        window.next.router.push(href);
+        return;
+      }
+    } catch { /* ниже запасные пути */ }
+    const native = [...menuLinks()].find((a) => a.getAttribute('href') === href);
+    if (native) native.click();
+    else location.assign(href);
+  }
+
+  function ensureFavorites() {
+    const header = document.querySelector('header.topbar');
+    if (!header || !reactReady(header)) return;
+    const fav = loadFav();
+    const favHrefs = new Set(fav.map((f) => f.href));
+    let renamed = false;
+
+    for (const a of menuLinks()) {
+      const href = a.getAttribute('href');
+      let star = a.querySelector(':scope > .vmfav-star');
+      if (!star) a.append(star = makeStar(a));
+      const on = favHrefs.has(href);
+      if (star.dataset.on !== String(on)) {
+        star.dataset.on = String(on);
+        star.textContent = on ? '★' : '☆';
+        star.title = on ? 'Убрать из избранного' : 'В избранное — пункт появится слева в шапке';
+        star.setAttribute('aria-label', star.title);
+        star.setAttribute('aria-pressed', String(on));
+      }
+      // сайт переименовал пункт — подпись в избранном тоже меняем
+      const f = on ? fav.find((x) => x.href === href) : null;
+      const label = f ? linkLabel(a) : '';
+      if (f && label && f.label !== label) {
+        f.label = label;
+        renamed = true;
+      }
+    }
+    if (renamed) saveFav(fav);
+
+    let bar = document.getElementById(FAV_ID);
+    if (!fav.length) {
+      bar?.remove();
+      favSig = '';
+      return;
+    }
+    const path = routePath(location.pathname);
+    const sig = JSON.stringify([fav, path]);
+    if (!bar || sig !== favSig) {
+      const fresh = h('nav', { id: FAV_ID, class: 'vmfav', 'aria-label': 'Избранное' },
+        fav.map((f) => {
+          const to = routePath(f.href);
+          const active = path === to || (to !== '/' && path.startsWith(`${to}/`));
+          return h('a', {
+            class: `nav-top-link vmfav-link${active ? ' active' : ''}`,
+            href: f.href,
+            title: `${f.label} — убрать из избранного можно звёздочкой в меню`,
+            'aria-current': active ? 'page' : null,
+            onclick: (e) => {
+              if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; // в новой вкладке — как обычно
+              e.preventDefault();
+              goTo(f.href);
+            },
+          }, f.label);
+        }));
+      if (bar) bar.replaceWith(fresh);
+      bar = fresh;
+      favSig = sig;
+    }
+    const brand = header.querySelector(':scope > a.brand');
+    if (brand ? bar.previousElementSibling !== brand : header.firstElementChild !== bar) {
+      if (brand) brand.after(bar);
+      else header.prepend(bar);
+    }
+  }
+
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
     document.head.append(h('style', { id: STYLE_ID }, CSS_TEXT));
@@ -1654,6 +1792,7 @@
       ensure();
       ensureCardHints();
       ensurePourButtons();
+      ensureFavorites();
     });
   }
 
@@ -1861,6 +2000,46 @@ button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: 
   .vmcal-thumb { height: 52px; }
   .vmcal-nav { display: none; }
 }
+
+/* ---------- избранное в шапке ---------- */
+:root { --vmfav-gold: #b8860b; }
+[data-theme="dark"] { --vmfav-gold: #e3b54f; }
+.vmfav { display: flex; align-items: center; gap: .1rem .3rem; flex: 0 1 auto; min-width: 0; overflow-x: auto;
+  scrollbar-width: none; padding-right: .75rem; border-right: 1px solid var(--line); }
+.vmfav::-webkit-scrollbar { display: none; }
+.vmfav::before { content: "★"; flex: none; margin-right: .1rem; font-size: .8rem; color: var(--vmfav-gold); }
+.vmfav .vmfav-link { display: inline-flex; align-items: center; flex: none; padding: .35rem .45rem; border-radius: 8px;
+  font-size: .88rem; font-weight: 600; color: var(--ink-soft); white-space: nowrap; text-decoration: none; box-shadow: none; }
+.vmfav .vmfav-link:hover { color: var(--ink); }
+.vmfav .vmfav-link.active { color: var(--ink); box-shadow: inset 0 -2px 0 var(--moss); }
+.vmfav-star { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 1.5em; height: 1.5em;
+  margin-left: auto; border-radius: 6px; font-size: .95em; font-weight: 400; line-height: 1; color: var(--ink-soft);
+  opacity: .35; cursor: pointer; user-select: none; transition: opacity .15s, color .15s, transform .15s; }
+a:hover > .vmfav-star { opacity: .75; }
+.vmfav-star[data-on="true"] { color: var(--vmfav-gold); opacity: 1; }
+.vmfav-star:hover, .vmfav-star:focus-visible { opacity: 1; color: var(--vmfav-gold); transform: scale(1.2); outline: none; }
+/* в выпадающих и мобильном меню: название слева, звёздочка справа */
+.app-shell :is(.nav-desktop .nav-group__links, .nav-mobile) a:has(> .vmfav-star) { display: flex; align-items: center; gap: .5rem; }
+/* верхние пункты («Игры», «Мастера»…): звёздочка в уголке и только при наведении — меню не раздвигается */
+.app-shell .nav-desktop .nav-top-link { position: relative; }
+.app-shell .nav-desktop .nav-top-link > .vmfav-star { position: absolute; top: -.45rem; right: -.55rem; width: 1.15rem; height: 1.15rem;
+  font-size: .78rem; opacity: 0; }
+.app-shell .nav-desktop .nav-top-link:hover > .vmfav-star, .app-shell .nav-desktop .nav-top-link > .vmfav-star:focus-visible { opacity: .85; }
+.app-shell .nav-desktop .nav-top-link > .vmfav-star:hover { opacity: 1; }
+@media (max-width: 1100px), (orientation: landscape) and (max-height: 540px) {
+  /* планшет: меню спрятано в «бургер» — избранное занимает место между «Вестмаршем» и кнопками, лишнее листается */
+  .topbar:has(> #vmfav) > .brand { flex: 0 0 auto; }
+  .vmfav { flex: 1 1 0; padding-right: 0; border-right: 0; gap: 0; }
+  .vmfav .vmfav-link { padding: .3rem .4rem; font-size: .85rem; }
+  .app-shell .nav-mobile .vmfav-star { width: 2.25rem; height: 2.25rem; margin-block: -.5rem; font-size: 1.15rem; opacity: .45; }
+  .app-shell .nav-mobile .vmfav-star[data-on="true"] { opacity: 1; }
+}
+@media (max-width: 600px) {
+  /* телефон: в одной строке с «Вестмаршем» места на пару слов — избранное отдельной строкой под ним */
+  .topbar:has(> #vmfav) { flex-wrap: wrap; row-gap: .35rem; }
+  .topbar:has(> #vmfav) > .brand { flex: 1 1 auto; }
+  .vmfav { order: 10; flex: 1 0 100%; margin-inline: -.2rem; }
+}
 `;
 
   injectStyle();
@@ -1869,6 +2048,10 @@ button.vmcal-card { appearance: none; width: 100%; margin: 0; padding: 0; font: 
   window.addEventListener('focus', onReturn);
   // свои игры поменяли в другой вкладке — перерисовываем
   window.addEventListener('storage', (e) => { if (e.key === OWN_KEY) render(); });
+  // избранное поменяли в другой вкладке — перестраиваем шапку
+  window.addEventListener('storage', (e) => { if (e.key === FAV_KEY) schedule(); });
+  // если страница ещё не «ожила» при запуске — повторяем, когда истечёт запасной срок гидратации
+  setTimeout(schedule, HYDRATION_FALLBACK_MS + 100);
   // на «Простое» после нажатий кнопок страницы (проверка, отдых, вклад) пересчитываем подсказку
   document.addEventListener('click', (e) => {
     if (isDowntimePage() && e.target.closest?.('button')) dtRefreshSoon();
