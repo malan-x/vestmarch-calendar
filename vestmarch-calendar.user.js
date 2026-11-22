@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.11.0
+// @version      1.11.1
 // @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад), кнопка «Влить все ОД», пустая «История ручных изменений» скрыта; на «Расследованиях» — шанс успеха на кнопках проверок. Звёздочки у пунктов меню — избранное в шапке.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1759,7 +1759,7 @@
     return /^\d+$/.test(v) ? Number(v) : Math.max(0, Number(char.exhaustion) || 0);
   }
 
-  // Модификатор и шанс успеха одной проверки; null — посчитать нечем.
+  // Модификатор и шанс успеха одной проверки; { error } — расчёт сайта не сработал (показываем «?» с причиной).
   function invCheckFor(char, extras, name, dc, exhaustion) {
     const key = `${invBase.at}|${extras.baseAt}|${char.id}|${name}|${dc}|${exhaustion}`;
     if (invChecks.has(key)) return invChecks.get(key);
@@ -1768,18 +1768,20 @@
       const tool = invBase.catalog.find((t) => t && t.name === name);
       if (tool) {
         const T = invBase.helpers.tools;
-        if (T) {
-          let profs = null;
-          try { profs = new Set(T.HE(extras.full, invBase.rules)); } catch { /* без владений */ }
-          const proficient = extras.multitool || !!profs?.has(tool.name);
-          const mod = dtToolCheckMod(invBase, char, extras, tool, proficient, exhaustion);
-          res = { mod, note: extras.multitool ? 'мультиинструмент' : proficient ? 'владение' : 'без владения' };
-        }
+        if (!T) throw new Error('не нашёл на странице расчёт инструментов');
+        let profs = null;
+        try { profs = new Set(T.HE(extras.full, invBase.rules)); } catch { /* без владений */ }
+        const proficient = extras.multitool || !!profs?.has(tool.name);
+        const mod = dtToolCheckMod(invBase, char, extras, tool, proficient, exhaustion);
+        res = { mod, note: extras.multitool ? 'мультиинструмент' : proficient ? 'владение' : 'без владения' };
       } else {
         res = dtSkillCheck(invBase, extras, name, exhaustion);
       }
-    } catch { res = null; /* навык, которого функция сайта не знает */ }
-    if (res) res.chance = dtOdds(res.mod, dc).s;
+      if (!Number.isFinite(res.mod)) throw new Error('модификатор не число');
+      res.chance = dtOdds(res.mod, dc).s;
+    } catch (e) {
+      res = { error: e?.message || String(e) };
+    }
     invChecks.set(key, res);
     return res;
   }
@@ -1812,18 +1814,25 @@
     const char = invCurrentChar();
     const extras = char ? ensureExtrasIn(invExtras, invExtrasLoading, invBase, char) : null;
     const exhaustion = char ? invExhaustion(char) : 0;
+    // Шанс показываем на любой кнопке проверки — и когда она неактивна (кончились ОД, идёт другой бросок).
+    const broken = (why) => {
+      const n = h('span', { class: 'vminv-odds is-none', title: `Подсказка закладки не смогла посчитать шанс: ${why}.` }, h('b', null, '?'));
+      n.dataset.key = n.title;
+      return n;
+    };
     for (const btn of buttons) {
       const old = btn.querySelector(':scope > .vminv-odds');
       let node = null;
       if (invError) {
-        node = h('span', { class: 'vminv-odds is-none', title: `Подсказка закладки недоступна: ${invError.message}.` }, h('b', null, '?'));
-        node.dataset.key = node.title;
+        node = broken(invError.message);
+      } else if (invBase?.loggedIn && !char) {
+        node = broken('не нашёл выбранного персонажа среди своих');
       } else if (char && extras) {
         const text = btn.querySelector(':scope > span:not(.investigation-action-symbol):not(.vminv-odds)');
         const name = text?.querySelector('strong')?.textContent.trim() || '';
         const dc = Number(/СЛ\s*(\d+)/.exec(text?.querySelector('small')?.textContent || '')?.[1] || 0);
-        const check = name && dc ? invCheckFor(char, extras, name, dc, exhaustion) : null;
-        if (check) node = invBadge(check, name, dc, exhaustion);
+        const check = name && dc ? invCheckFor(char, extras, name, dc, exhaustion) : { error: 'не разобрал на кнопке навык и СЛ' };
+        node = check.error ? broken(check.error) : invBadge(check, name, dc, exhaustion);
       }
       if (!node) {
         if (old) old.remove();
