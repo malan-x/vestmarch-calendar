@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.10.0
-// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад), кнопка «Влить все ОД», пустая «История ручных изменений» скрыта. Звёздочки у пунктов меню — избранное в шапке.
+// @version      1.11.0
+// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад), кнопка «Влить все ОД», пустая «История ручных изменений» скрыта; на «Расследованиях» — шанс успеха на кнопках проверок. Звёздочки у пунктов меню — избранное в шапке.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
 // @downloadURL  https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1292,18 +1292,19 @@
     return dtBase.chars.length === 1 ? dtBase.chars[0] : null;
   }
   // Данные выбранного персонажа: отдаём, что есть (пусть и от прошлой загрузки), и догружаем свежие в фоне.
-  function dtEnsureExtras(char) {
-    const entry = dtExtras.get(char.id) || null;
-    if ((!entry || entry.baseAt !== dtBase.at) && !dtExtrasLoading.has(char.id)) {
-      const base = dtBase;
-      dtExtrasLoading.add(char.id);
+  // cache/loading — свои у «Простоя» и «Расследований».
+  function ensureExtrasIn(cache, loading, base, char) {
+    const entry = cache.get(char.id) || null;
+    if ((!entry || entry.baseAt !== base.at) && !loading.has(char.id)) {
+      loading.add(char.id);
       dtLoadExtras(base, char)
-        .then((x) => dtExtras.set(char.id, { ...x, baseAt: base.at }))
-        .catch(() => dtExtras.set(char.id, { full: { ...char, effectMechanics: [] }, mechanics: [], items: [], multitool: false, baseAt: base.at }))
-        .finally(() => { dtExtrasLoading.delete(char.id); schedule(); });
+        .then((x) => cache.set(char.id, { ...x, baseAt: base.at }))
+        .catch(() => cache.set(char.id, { full: { ...char, effectMechanics: [] }, mechanics: [], items: [], multitool: false, baseAt: base.at }))
+        .finally(() => { loading.delete(char.id); schedule(); });
     }
     return entry;
   }
+  const dtEnsureExtras = (char) => ensureExtrasIn(dtExtras, dtExtrasLoading, dtBase, char);
   // Сколько ОД у выбранного персонажа: блок «Очки действий» (или текст варианта в списке). ∞ — тестовый персонаж.
   function dtCurrentAp() {
     const v = document.querySelector('.downtime-status-ap-value');
@@ -1338,6 +1339,23 @@
     return !!x && !!y && (x === y || x.startsWith(`${y} `) || x.startsWith(`${y} (`));
   };
 
+  // Модификатор проверки — как у сайта: характеристика + БМ + бонус порядка + эффекты − истощение.
+  // Общий для «Простоя» и «Расследований».
+  function dtSkillCheck(base, extras, skill, exhaustion) {
+    const b = base.helpers.skill(extras.full, skill, base.rules);
+    return {
+      mod: (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion,
+      note: b.expertise ? 'экспертиза' : b.trained ? 'владение' : b.jackOfAllTrades ? 'мастер на все руки' : 'без владения',
+    };
+  }
+  function dtToolCheckMod(base, char, extras, tool, proficient, exhaustion) {
+    const T = base.helpers.tools;
+    const abilityMod = tool.abilityKey ? T.J3(T.T_(extras.full, base.rules)[tool.abilityKey]) : 0;
+    const pb = proficient ? T.Zm(char.level ?? 1) : 0;
+    const bonus = Number(T.$R(extras.mechanics, 'tool', tool.name)) || 0;
+    return abilityMod + pb + bonus - exhaustion;
+  }
+
   // Варианты проверки проекта для одного персонажа, лучшие сверху.
   function dtOptionsFor(project, char, extras) {
     const key = `${dtBase.at}|${extras.baseAt}|${char.id}|${project.id}`;
@@ -1357,11 +1375,9 @@
     let failed = 0;
     for (const skill of project.skills || []) {
       try {
-        const b = helpers.skill(extras.full, skill, rules);
+        const { mod, note } = dtSkillCheck(dtBase, extras, skill, exhaustion);
         const adv = advantage(skill);
-        const note = (b.expertise ? 'экспертиза' : b.trained ? 'владение' : b.jackOfAllTrades ? 'мастер на все руки' : 'без владения')
-          + (adv ? ', преимущество' : '');
-        out.push({ label: skill, note, adv, mod: (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion });
+        out.push({ label: skill, note: note + (adv ? ', преимущество' : ''), adv, mod });
       } catch { failed++; /* навык, которого функция сайта не знает */ }
     }
     if (T) {
@@ -1370,11 +1386,8 @@
           const proficient = extras.multitool || !!toolProfs?.has(tool.name);
           const owned = extras.items.some((it) => dtSameName(it?.name, tool.name));
           if (!proficient && !owned) continue; // ни владения, ни инструмента — такой проверки у персонажа нет
-          const abilityMod = tool.abilityKey ? T.J3(T.T_(extras.full, rules)[tool.abilityKey]) : 0;
-          const pb = proficient ? T.Zm(char.level ?? 1) : 0;
-          const bonus = Number(T.$R(extras.mechanics, 'tool', tool.name)) || 0;
           const note = extras.multitool ? 'мультиинструмент' : proficient ? 'владение' : 'свой, без владения';
-          out.push({ label: tool.name, note, adv: false, mod: abilityMod + pb + bonus - exhaustion });
+          out.push({ label: tool.name, note, adv: false, mod: dtToolCheckMod(dtBase, char, extras, tool, proficient, exhaustion) });
         } catch { failed++; }
       }
     }
@@ -1692,6 +1705,136 @@
     }
   }
 
+  // ---------- «Расследования»: шанс успеха на кнопках проверок ----------
+  // Правила этапа: любое действие (проверка или пассивный вклад) даёт +1 к прогрессу, провал проверки увеличивает счётчик
+  // провалов. Истощения за провал нет, натуральные 20 и 1 — просто успех и провал. Поэтому показываем только шанс успеха:
+  // d20 + модификатор ≥ СЛ, натуральная 20 — всегда успех, натуральная 1 — всегда провал.
+  // Кнопки проверок страница рисует только доступные выбранному персонажу (навык с владением, инструмент с владением
+  // или мультиинструмент); в каждой — название и «Проверка · СЛ N · 1 ОД». Проницательность ради подсказки не трогаем:
+  // её СЛ игрокам не показывают.
+
+  const isInvestigationsPage = () => location.pathname.replace(/\/+$/, '') === '/investigations';
+  let invBase = null;     // { loggedIn, helpers, rules, chars, catalog, at }
+  let invLoading = null;
+  let invError = null;
+  const invExtras = new Map();
+  const invExtrasLoading = new Set();
+  const invChecks = new Map(); // «персонаж + проверка + СЛ + истощение» → { mod, note, chance }
+
+  async function invLoadBase() {
+    const helpers = siteHelpers();
+    if (!helpers) throw new Error('не нашёл на странице расчёт навыков — похоже, сайт обновился');
+    const userId = await fetchUserId();
+    if (!userId) return { loggedIn: false, at: Date.now() };
+    const [chars, catalog, rules] = await Promise.all([
+      rpcNs('characters', 'FetchCharacters', []),
+      rpcNs('tools', 'FetchToolCatalog', []).catch(() => []),
+      dtLoadRules(helpers),
+    ]);
+    // как на странице: свои персонажи — живые, не тестовые, не в плену; без выбора — первый по имени
+    const own = (chars || []).filter((c) => c && c.ownerId === userId && !c.isTest && !c.isDead && !c.isCaptured)
+      .sort((a, b) => String(a.name).localeCompare(String(b.name), 'ru'));
+    return { loggedIn: true, helpers, rules, chars: own, catalog: catalog || [], at: Date.now() };
+  }
+
+  function invRefresh(force) {
+    if (invLoading) return invLoading;
+    if (!force && invBase && Date.now() - invBase.at < DT_REFRESH_MS) return Promise.resolve();
+    invLoading = invLoadBase()
+      .then((b) => { invBase = b; invError = null; invChecks.clear(); })
+      .catch((e) => { invError = e; })
+      .finally(() => { invLoading = null; schedule(); });
+    return invLoading;
+  }
+
+  function invCurrentChar() {
+    if (!invBase?.loggedIn) return null;
+    const id = document.querySelector('select[name="investigation-character"]')?.value;
+    if (id) return invBase.chars.find((c) => String(c.id) === String(id)) || null;
+    return invBase.chars[0] || null;
+  }
+  // Истощение — из карточки персонажа на странице (она обновляется сразу после бросков), иначе из данных персонажа.
+  function invExhaustion(char) {
+    const v = document.querySelector('.investigations__resource--exhaustion strong')?.textContent.trim() || '';
+    return /^\d+$/.test(v) ? Number(v) : Math.max(0, Number(char.exhaustion) || 0);
+  }
+
+  // Модификатор и шанс успеха одной проверки; null — посчитать нечем.
+  function invCheckFor(char, extras, name, dc, exhaustion) {
+    const key = `${invBase.at}|${extras.baseAt}|${char.id}|${name}|${dc}|${exhaustion}`;
+    if (invChecks.has(key)) return invChecks.get(key);
+    let res = null;
+    try {
+      const tool = invBase.catalog.find((t) => t && t.name === name);
+      if (tool) {
+        const T = invBase.helpers.tools;
+        if (T) {
+          let profs = null;
+          try { profs = new Set(T.HE(extras.full, invBase.rules)); } catch { /* без владений */ }
+          const proficient = extras.multitool || !!profs?.has(tool.name);
+          const mod = dtToolCheckMod(invBase, char, extras, tool, proficient, exhaustion);
+          res = { mod, note: extras.multitool ? 'мультиинструмент' : proficient ? 'владение' : 'без владения' };
+        }
+      } else {
+        res = dtSkillCheck(invBase, extras, name, exhaustion);
+      }
+    } catch { res = null; /* навык, которого функция сайта не знает */ }
+    if (res) res.chance = dtOdds(res.mod, dc).s;
+    invChecks.set(key, res);
+    return res;
+  }
+
+  // Цвет шанса: 25% и ниже — красный, около 55% — жёлтый, 85% и выше — зелёный.
+  const invHue = (chance) => Math.round(125 * Math.min(1, Math.max(0, (chance - 0.25) / 0.6)));
+
+  function invBadge(check, name, dc, exhaustion) {
+    const p = Math.round(check.chance * 100);
+    const node = h('span', {
+      class: 'vminv-odds',
+      style: `--vminv-h:${invHue(check.chance)}`,
+      title: `Подсказка закладки «Календарь Вестмарша»: ${name} ${signed(check.mod)} (${check.note}`
+        + `${exhaustion > 0 ? `, с истощением −${exhaustion}` : ''}) против СЛ ${dc} — успех ${p}%, провал ${100 - p}%. `
+        + 'Натуральная 20 — всегда успех, натуральная 1 — всегда провал.',
+    }, h('b', null, `${p}%`), h('small', null, `d20${signed(check.mod)}`));
+    node.dataset.key = node.title;
+    return node;
+  }
+
+  const invCheckButtons = () => [...document.querySelectorAll('.investigation-contribution .investigation-stage__actions > button.btn')]
+    .filter((b) => b.querySelector(':scope > .investigation-action-symbol')?.textContent.trim() === 'd20');
+
+  // Значок ставим последним в родную кнопку и меняем только при изменении (иначе наблюдатель за DOM зациклится).
+  function ensureInvestigationOdds() {
+    if (!isInvestigationsPage()) return;
+    const buttons = invCheckButtons();
+    if (!buttons.length) return;
+    if (!invBase && !invLoading && !invError) invRefresh(false);
+    const char = invCurrentChar();
+    const extras = char ? ensureExtrasIn(invExtras, invExtrasLoading, invBase, char) : null;
+    const exhaustion = char ? invExhaustion(char) : 0;
+    for (const btn of buttons) {
+      const old = btn.querySelector(':scope > .vminv-odds');
+      let node = null;
+      if (invError) {
+        node = h('span', { class: 'vminv-odds is-none', title: `Подсказка закладки недоступна: ${invError.message}.` }, h('b', null, '?'));
+        node.dataset.key = node.title;
+      } else if (char && extras) {
+        const text = btn.querySelector(':scope > span:not(.investigation-action-symbol):not(.vminv-odds)');
+        const name = text?.querySelector('strong')?.textContent.trim() || '';
+        const dc = Number(/СЛ\s*(\d+)/.exec(text?.querySelector('small')?.textContent || '')?.[1] || 0);
+        const check = name && dc ? invCheckFor(char, extras, name, dc, exhaustion) : null;
+        if (check) node = invBadge(check, name, dc, exhaustion);
+      }
+      if (!node) {
+        if (old) old.remove();
+        continue;
+      }
+      if (old && old.dataset.key === node.dataset.key && !old.nextElementSibling) continue;
+      if (old) old.remove();
+      btn.append(node);
+    }
+  }
+
   // ---------- встраивание в страницу ----------
 
   const isGamesPage =() => location.pathname.replace(/\/+$/, '') === '/games';
@@ -1873,6 +2016,7 @@
       ensureCardHints();
       ensurePourButtons();
       ensureHistoryBlocks();
+      ensureInvestigationOdds();
       ensureFavorites();
     });
   }
@@ -1881,6 +2025,7 @@
     if (document.visibilityState !== 'visible') return;
     if (isGamesPage() && document.getElementById(ROOT_ID)) refresh(false);
     if (isDowntimePage() && document.querySelector('li.downtime-card')) dtRefresh(false);
+    if (isInvestigationsPage() && invCheckButtons().length) invRefresh(false);
   };
 
   // Цвета берём из переменных темы сайта — так блок сам подстраивается под светлую и тёмную тему.
@@ -1969,6 +2114,20 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: auto; max-width: none; margin-in
 @media (max-width: 640px) {
   .vmdt-verdict { text-align: left; }
 }
+
+/* «Расследования»: шанс успеха на кнопках проверок. Сайт раскладывает текст кнопки правилом «.btn > span:last-child»;
+   значок встаёт последним, поэтому ту же раскладку возвращаем текстовому блоку перед ним.
+   Кнопка в светлой теме тёмная (--earth), в тёмной — светлая: цвет значка подбираем под неё. */
+.investigation-stage__actions .btn:has(> .vminv-odds) > span:nth-last-child(2) { display: grid; gap: .13rem; min-width: 0; }
+.investigation-stage__actions .btn > span.vminv-odds { --vminv-h: 45; margin-left: auto; flex: 0 0 auto; display: grid;
+  justify-items: end; gap: 0; padding: .2rem .5rem; border-radius: 8px; line-height: 1.15; text-align: right;
+  color: hsl(var(--vminv-h) 85% 80%); background: hsl(var(--vminv-h) 60% 50% / .22);
+  box-shadow: inset 0 0 0 1px hsl(var(--vminv-h) 60% 60% / .45); }
+.investigation-stage__actions .btn > span.vminv-odds b { font-size: 1rem; font-variant-numeric: tabular-nums; }
+.investigation-stage__actions .btn > span.vminv-odds small { font-size: .66rem; font-weight: 600; opacity: .85; }
+.investigation-stage__actions .btn > span.vminv-odds.is-none { filter: saturate(0); }
+[data-theme=dark] .investigation-stage__actions .btn > span.vminv-odds { color: hsl(var(--vminv-h) 75% 24%);
+  background: hsl(var(--vminv-h) 55% 40% / .16); box-shadow: inset 0 0 0 1px hsl(var(--vminv-h) 55% 30% / .4); }
 
 /* свои игры и накладки */
 #vmcal, .vmcal-dialog { --vmcal-own: #3e5aa8; --vmcal-own-soft: rgba(62,90,168,.09); --vmcal-on-own: #fff;
@@ -2138,9 +2297,9 @@ a:hover > .vmfav-star { opacity: .75; }
   document.addEventListener('click', (e) => {
     if (isDowntimePage() && e.target.closest?.('button')) dtRefreshSoon();
   }, true);
-  // выбрали на странице другого персонажа — подсказки в карточках про него
+  // выбрали на странице другого персонажа — подсказки в карточках («Простой») и на кнопках («Расследования») про него
   document.addEventListener('change', (e) => {
-    if (isDowntimePage() && e.target instanceof HTMLSelectElement) schedule();
+    if ((isDowntimePage() || isInvestigationsPage()) && e.target instanceof HTMLSelectElement) schedule();
   }, true);
   schedule();
 })();
