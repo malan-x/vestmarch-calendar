@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Вестмарш — календарь игр
 // @namespace    https://vestmarch.noncensored.ru/
-// @version      1.9.0
-// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад) и кнопка «Влить все ОД». Звёздочки у пунктов меню — избранное в шапке.
+// @version      1.10.0
+// @description  Лента-календарь над списком игр (свои игры, отметки «занят», накладки) и на странице «Простой» — подсказки в карточках проектов (проверка или вклад), кнопка «Влить все ОД», пустая «История ручных изменений» скрыта. Звёздочки у пунктов меню — избранное в шапке.
 // @homepageURL  https://malan-x.github.io/vestmarch-calendar/
 // @updateURL    https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
 // @downloadURL  https://malan-x.github.io/vestmarch-calendar/vestmarch-calendar.user.js
@@ -1185,21 +1185,42 @@
     }
     return null;
   }
+  // Номера модулей — с обновления сайта в ноябре 2026 (раньше были 68943, 51226, 85119); если сменятся — найдём по приметам.
   function siteHelpers() {
-    const sk = siteModule(68943, ['w7'], ['jackOfAllTrades', 'abilityShort', 'checkBonusTargets']);
+    const sk = siteModule(57486, ['w7'], ['jackOfAllTrades', 'abilityShort', 'checkBonusTargets']);
     if (!sk) return null;
     let tools = null;
     try {
       if (['J3', 'T_', 'Zm', 'HE', '$R'].every((k) => typeof sk[k] === 'function') && sk.Zm(5) === 3 && sk.J3(14) === 2) tools = sk;
     } catch { /* без инструментов */ }
-    const fx = siteModule(51226, ['ed']);
-    const mt = siteModule(85119, ['_s'], ['manifold-tool']);
+    const fx = siteModule(81031, ['ed'], ['blockedEffectCategories']);
+    const mt = siteModule(55777, ['_s'], ['мультиинструмент']);
+    // Игровой справочник сайта (навыки, характеристики, черты): функции расчёта принимают его последним аргументом.
+    const rules = siteModule(55777, ['KG', '$W'], ['Не загружен игровой справочник']);
+    const refs = siteModule(52308, ['K7'], ['FetchReferences']);
     return {
       skill: sk.w7,
       tools,
       mergeEffects: fx ? fx.ed : null,
       isMultitool: mt ? mt._s : (name) => /мультиинструмент|manifold/i.test(name || ''),
+      buildRules: rules ? rules.KG : null,
+      fetchReferences: refs ? refs.K7 : () => rpcNs('references', 'FetchReferences', []),
     };
+  }
+
+  // Справочник один на всех и меняется редко — грузим один раз за сессию (как и сам сайт).
+  let dtRules = null;
+  async function dtLoadRules(helpers) {
+    if (!helpers.buildRules) return undefined; // старая версия сайта — функции обходятся без справочника
+    if (!dtRules) {
+      dtRules = Promise.resolve(helpers.fetchReferences()).then((refs) => helpers.buildRules(refs || []));
+      dtRules.catch(() => { dtRules = null; });
+    }
+    try {
+      return await dtRules;
+    } catch {
+      throw new Error('не загрузился игровой справочник сайта');
+    }
   }
 
   async function dtLoadBase() {
@@ -1207,15 +1228,18 @@
     if (!helpers) throw new Error('не нашёл на странице расчёт навыков — похоже, сайт обновился');
     const userId = await fetchUserId();
     if (!userId) return { loggedIn: false, at: Date.now() };
-    const [chars, projects, catalog] = await Promise.all([
+    const [chars, projects, catalog, rules] = await Promise.all([
       rpcNs('characters', 'FetchCharacters', []),
       rpcNs('downtime', 'FetchStrongholdProjects', []),
       rpcNs('tools', 'FetchToolCatalog', []).catch(() => []),
+      dtLoadRules(helpers),
     ]);
     return {
       loggedIn: true,
       helpers,
+      rules,
       chars: (chars || []).filter((c) => c && c.ownerId === userId && !c.isDead),
+      allProjects: (projects || []).filter(Boolean),
       projects: (projects || []).filter((p) => p && (p.status === 'active' || p.isInfinite)
         && ((p.skills?.length || 0) + (p.tools?.length || 0)) > 0),
       catalog: catalog || [],
@@ -1294,11 +1318,16 @@
 
   // Вероятности на d20: натуральная 20 — крит. успех, натуральная 1 — крит. провал, остальное — сравнение с СЛ.
   // s — все успехи (включая натуральную 20), cs — из них крит. успехи, f — обычные провалы, c — натуральная 1.
-  function dtOdds(mod, dc) {
-    let s = 1;
-    for (let r = 2; r <= 19; r++) if (r + mod >= dc) s++;
-    const c = 1;
-    return { s: s / 20, cs: 1 / 20, f: (20 - s - c) / 20, c: c / 20 };
+  // С преимуществом берётся бо́льшая из двух костей: P(выпало r) = (2r − 1) / 400.
+  function dtOdds(mod, dc, adv = false) {
+    const w = (r) => (adv ? (2 * r - 1) / 400 : 1 / 20);
+    let s = 0;
+    let f = 0;
+    for (let r = 2; r <= 19; r++) {
+      if (r + mod >= dc) s += w(r);
+      else f += w(r);
+    }
+    return { s: s + w(20), cs: w(20), f, c: w(1) };
   }
   // Прогресс на одно потраченное ОД с учётом лечения истощения:
   // (2·обычный успех + 3·крит. успех) / (1 + 2·провал + 4·крит. провал). У вклада «+1» — ровно 1.
@@ -1314,39 +1343,48 @@
     const key = `${dtBase.at}|${extras.baseAt}|${char.id}|${project.id}`;
     const hit = dtOptionsCache.get(key);
     if (hit) return hit;
-    const { helpers, catalog } = dtBase;
+    const { helpers, catalog, rules } = dtBase;
     const exhaustion = Math.max(0, Number(char.exhaustion) || 0);
+    const T = helpers.tools;
+    const projectTools = (project.tools || []).map((name) => catalog.find((t) => t && t.name === name)).filter(Boolean);
+    let toolProfs = null; // инструменты, которыми персонаж владеет (класс, предыстория, черты, эффекты)
+    try { toolProfs = T ? new Set(T.HE(extras.full, rules)) : null; } catch { /* без владений */ }
+    // Как на сайте: навык проверяется с преимуществом, если среди инструментов проекта есть связанный с ним,
+    // и персонаж этим инструментом владеет (или у него настроенный мультиинструмент).
+    const advantage = (skill) => projectTools.some((t) => (t.relatedSkills || []).includes(skill)
+      && (extras.multitool || !!toolProfs?.has(t.name)));
     const out = [];
+    let failed = 0;
     for (const skill of project.skills || []) {
       try {
-        const b = helpers.skill(extras.full, skill);
-        const note = b.expertise ? 'экспертиза' : b.trained ? 'владение' : b.jackOfAllTrades ? 'мастер на все руки' : 'без владения';
-        out.push({ label: skill, note, mod: (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion });
-      } catch { /* навык, которого функция сайта не знает */ }
+        const b = helpers.skill(extras.full, skill, rules);
+        const adv = advantage(skill);
+        const note = (b.expertise ? 'экспертиза' : b.trained ? 'владение' : b.jackOfAllTrades ? 'мастер на все руки' : 'без владения')
+          + (adv ? ', преимущество' : '');
+        out.push({ label: skill, note, adv, mod: (b.abilityMod || 0) + (b.pb || 0) + (b.orderBonus || 0) + (b.checkBonus || 0) - exhaustion });
+      } catch { failed++; /* навык, которого функция сайта не знает */ }
     }
-    if (helpers.tools) {
-      const T = helpers.tools;
-      for (const name of project.tools || []) {
-        const tool = catalog.find((t) => t && t.name === name);
-        if (!tool) continue;
+    if (T) {
+      for (const tool of projectTools) {
         try {
-          const proficient = extras.multitool || T.HE(extras.full).includes(tool.name);
+          const proficient = extras.multitool || !!toolProfs?.has(tool.name);
           const owned = extras.items.some((it) => dtSameName(it?.name, tool.name));
           if (!proficient && !owned) continue; // ни владения, ни инструмента — такой проверки у персонажа нет
-          const abilityMod = tool.abilityKey ? T.J3(T.T_(extras.full)[tool.abilityKey]) : 0;
+          const abilityMod = tool.abilityKey ? T.J3(T.T_(extras.full, rules)[tool.abilityKey]) : 0;
           const pb = proficient ? T.Zm(char.level ?? 1) : 0;
           const bonus = Number(T.$R(extras.mechanics, 'tool', tool.name)) || 0;
           const note = extras.multitool ? 'мультиинструмент' : proficient ? 'владение' : 'свой, без владения';
-          out.push({ label: tool.name, note, mod: abilityMod + pb + bonus - exhaustion });
-        } catch { /* пропускаем */ }
+          out.push({ label: tool.name, note, adv: false, mod: abilityMod + pb + bonus - exhaustion });
+        } catch { failed++; }
       }
     }
     const dc = Number(project.checkDc) || 0;
     for (const o of out) {
-      o.odds = dtOdds(o.mod, dc);
+      o.odds = dtOdds(o.mod, dc, o.adv);
       o.gain = dtGain(o.odds);
     }
     out.sort((a, b) => b.gain - a.gain || b.mod - a.mod);
+    out.broken = !out.length && failed > 0; // расчёт сайта не сработал ни разу — это не «нечем проверять»
     dtOptionsCache.set(key, out);
     return out;
   }
@@ -1391,9 +1429,11 @@
   function dtVerdict(options, char, title) {
     const tip = 'Подсказка закладки «Календарь Вестмарша»: на сколько больше (или меньше) прогресса на каждое ОД даёт проверка '
       + 'лучшим навыком, чем вклад «+1». Учтено: успех +2, натуральная 20 — +3, провал — истощение, натуральная 1 — два истощения; '
-      + 'снять истощение стоит 2 ОД.';
+      + 'снять истощение стоит 2 ОД; преимущество — если персонаж владеет связанным с навыком инструментом проекта.';
     if (!options.length) {
-      const node = h('div', { class: 'vmdt-verdict is-none', title: tip }, 'Проверка недоступна: нет подходящих навыков и инструментов');
+      const node = h('div', { class: 'vmdt-verdict is-none', title: tip }, options.broken
+        ? 'Подсказка закладки не смогла посчитать проверку — похоже, сайт поменял расчёт навыков'
+        : 'Проверка недоступна: нет подходящих навыков и инструментов');
       node.dataset.key = node.textContent;
       return node;
     }
@@ -1402,7 +1442,7 @@
     const rows = options.map((o) => h('li', {
       class: 'vmdt-row',
       style: dtToneStyle(o.gain),
-      title: `успех ${pct(o.odds.s)} (из них натуральная 20 — ${pct(o.odds.cs)}, +3), провал ${pct(o.odds.f)}, `
+      title: `${o.adv ? 'с преимуществом: ' : ''}успех ${pct(o.odds.s)} (из них натуральная 20 — ${pct(o.odds.cs)}, +3), провал ${pct(o.odds.f)}, `
         + `натуральная 1 — ${pct(o.odds.c)}; 10 ОД → ${per10(o.gain)} прогресса вместо 10`,
     },
       h('span', { class: 'vmdt-skill' }, `${o.label} ${signed(o.mod)}`, h('span', { class: 'vmdt-note' }, ` · ${o.note}`)),
@@ -1411,7 +1451,8 @@
     const node = h('div', { class: 'vmdt-verdict', style: dtToneStyle(best.gain), title: tip },
       h('div', { class: 'vmdt-vline' },
         h('b', { class: 'vmdt-vpct' }, dtVerdictText(best.gain)),
-        h('span', { class: 'vmdt-vskill' }, ` · ${best.label} ${signed(best.mod)}${exhaustion > 0 ? ` (с истощением −${exhaustion})` : ''}`),
+        h('span', { class: 'vmdt-vskill' }, ` · ${best.label} ${signed(best.mod)}${best.adv ? ' с преимуществом' : ''}`
+          + `${exhaustion > 0 ? ` (с истощением −${exhaustion})` : ''}`),
       ),
       h('details', {
         class: 'vmdt-more',
@@ -1612,9 +1653,48 @@
     }
   }
 
+  // ---- «История ручных изменений»: пустую не показываем ----
+  // Сайт ставит свёрнутый блок в каждую карточку проекта, а записи грузит, только когда его раскроют. Мы заранее
+  // спрашиваем тем же запросом, что и сайт, есть ли записи, и пустой блок прячем. Ответ помним, пока проект не
+  // изменится: сайт пересоздаёт блок с ключом «id:updatedAt», его и берём из React (запасной путь — по названию).
+  const DT_HISTORY_PARALLEL = 3;
+  const dtHistory = new Map(); // «id:updatedAt» → 'loading' | 'empty' | 'has' | 'error'
+  let dtHistoryBusy = 0;
+
+  function dtHistoryRef(box, card) {
+    try {
+      const fk = Object.keys(box).find((k) => k.startsWith('__reactFiber'));
+      for (let f = fk ? box[fk] : null, i = 0; f && i < 6; f = f.return, i++) {
+        const id = f.memoizedProps?.projectId;
+        if (id != null) return { id, key: f.key != null ? String(f.key) : String(id) };
+      }
+    } catch { /* без React — ищем по названию */ }
+    const p = dtBase?.loggedIn ? dtBase.allProjects.find((x) => x.title === dtCardTitle(card)) : null;
+    return p ? { id: p.id, key: `${p.id}:${p.updatedAt ?? ''}` } : null;
+  }
+
+  function ensureHistoryBlocks() {
+    if (!isDowntimePage()) return;
+    for (const card of document.querySelectorAll('li.downtime-card')) {
+      const box = card.querySelector('details.downtime-adjustment-history');
+      if (!box) continue;
+      const ref = dtHistoryRef(box, card);
+      const state = ref ? dtHistory.get(ref.key) : undefined;
+      if (ref && state === undefined && dtHistoryBusy < DT_HISTORY_PARALLEL) {
+        dtHistory.set(ref.key, 'loading');
+        dtHistoryBusy++;
+        rpcNs('downtime', 'FetchStrongholdProjectAdjustments', [ref.id])
+          .then((list) => dtHistory.set(ref.key, Array.isArray(list) && !list.length ? 'empty' : 'has'))
+          .catch(() => dtHistory.set(ref.key, 'error')) // не знаем — оставляем как у сайта
+          .finally(() => { dtHistoryBusy--; schedule(); });
+      }
+      dtMark(box, 'data-vmdt-empty', state === 'empty' && !box.open ? '' : null);
+    }
+  }
+
   // ---------- встраивание в страницу ----------
 
-  const isGamesPage = () => location.pathname.replace(/\/+$/, '') === '/games';
+  const isGamesPage =() => location.pathname.replace(/\/+$/, '') === '/games';
 
   // Ждём, пока React «оживит» страницу: вставка до гидратации приведёт к перерисовке и потере блока.
   // Список игр (.games-section) появляется только после загрузки данных на клиенте, т.е. уже после гидратации.
@@ -1792,6 +1872,7 @@
       ensure();
       ensureCardHints();
       ensurePourButtons();
+      ensureHistoryBlocks();
       ensureFavorites();
     });
   }
@@ -1883,6 +1964,7 @@ main.main:has(> #vmcal) > :not(#vmcal) { width: auto; max-width: none; margin-in
   color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 27%); background: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 45% / .15); }
 [data-theme=dark] .downtime-card .downtime-card-actions button.btn[data-vmdt-check] { border-color: hsl(var(--vmdt-h) var(--vmdt-s, 60%) 55%);
   color: hsl(var(--vmdt-h) var(--vmdt-s, 70%) 72%); background: hsl(var(--vmdt-h) var(--vmdt-s, 60%) 50% / .2); }
+.downtime-card details.downtime-adjustment-history[data-vmdt-empty] { display: none; }
 .downtime-card .downtime-card-actions button.btn[data-vmdt-best] { box-shadow: 0 0 0 2px hsl(130 55% 38%), 0 0 0 5px hsl(130 55% 40% / .2); }
 @media (max-width: 640px) {
   .vmdt-verdict { text-align: left; }
